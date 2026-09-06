@@ -1,7 +1,7 @@
 { lib, rustPlatform }:
 
 rustPlatform.buildRustPackage rec {
-  pname = "lusty-native";
+  pname = "lusty";
   version = "0.1.0";
 
   src = ./.;
@@ -11,9 +11,9 @@ rustPlatform.buildRustPackage rec {
 
   meta = with lib; {
     description = "Native file/buffer picker for Neovim (Lusty successor)";
-    homepage = "https://github.com/neg-serg/nixos-config";
+    homepage = "https://github.com/neg-serg/lusty";
     license = licenses.mit;
-    mainProgram = "lusty-native";
+    mainProgram = "lusty";
     platforms = platforms.linux;
     maintainers = [ ];
   };

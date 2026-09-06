@@ -1,5 +1,5 @@
 //! Smart subsequence fuzzy scorer (fzy-style), ported 1:1 from the Lua port
-//! (files/nvim/lua/lusty/fuzzy.lua). Default engine for Lusty-native.
+//! (files/nvim/lua/lusty/fuzzy.lua). Default engine for Lusty.
 
 const LEADING_PENALTY: f64 = 0.012; // per skipped char before the first match
 const INNER_GAP: f64 = 0.02; // per skipped char between two matches

@@ -21,7 +21,7 @@ fn root_dir() -> std::path::PathBuf {
 }
 
 fn spawn(dir: &Path) -> (Child, ChildStdin, std::io::Lines<BufReader<std::process::ChildStdout>>) {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_lusty-native"))
+    let mut child = Command::new(env!("CARGO_BIN_EXE_lusty"))
         .arg("serve")
         .arg(dir)
         .arg("--depth")
@@ -32,7 +32,7 @@ fn spawn(dir: &Path) -> (Child, ChildStdin, std::io::Lines<BufReader<std::proces
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
-        .expect("spawn lusty-native serve");
+        .expect("spawn lusty serve");
     let stdin = child.stdin.take().expect("serve stdin");
     let stdout = child.stdout.take().expect("serve stdout");
     let lines = BufReader::new(stdout).lines();

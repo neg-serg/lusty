@@ -1,12 +1,12 @@
 [package]
-name = "lusty-native"
+name = "lusty"
 version = "0.1.0"
 edition = "2021"
 description = "Native file/buffer picker for Neovim (Lusty successor)"
 license = "MIT"
 
 [[bin]]
-name = "lusty-native"
+name = "lusty"
 path = "src/main.rs"
 
 [dependencies]

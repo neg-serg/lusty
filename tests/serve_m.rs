@@ -4,7 +4,7 @@
 //!   Q <from> <to> <query>       -> N/W/R rows + E (ranking, visible page)
 //!   M <mask> <index>...         -> "K <i> <meta>" per entry index + E
 //!
-//! Cargo sets CARGO_BIN_EXE_lusty-native for integration tests, so the
+//! Cargo sets CARGO_BIN_EXE_lusty for integration tests, so the
 //! real binary is exercised over pipes.
 
 use std::io::{BufRead, BufReader, Write};
@@ -31,7 +31,7 @@ fn spawn(
     ChildStdin,
     std::io::Lines<BufReader<std::process::ChildStdout>>,
 ) {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_lusty-native"))
+    let mut child = Command::new(env!("CARGO_BIN_EXE_lusty"))
         .arg("serve")
         .arg(dir)
         .arg("--depth")
@@ -42,7 +42,7 @@ fn spawn(
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
-        .expect("spawn lusty-native serve");
+        .expect("spawn lusty serve");
     let stdin = child.stdin.take().expect("serve stdin");
     let stdout = child.stdout.take().expect("serve stdout");
     let lines = BufReader::new(stdout).lines();

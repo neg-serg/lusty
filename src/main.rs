@@ -1,4 +1,4 @@
-//! lusty-native: native file/buffer picker for Neovim.
+//! lusty: native file/buffer picker for Neovim.
 //!
 //! Phase 1-3: --list mode (benchmark + plumbing) with depth/skip/mount
 //! semantics, query ranking and LS_COLORS-aware coloring. The TUI lands in a
@@ -25,7 +25,7 @@ fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.iter().any(|a| a == "-h" || a == "--help") {
         println!(
-            "usage: lusty-native [root] [--depth N] [--skip a,b] [--rows N] [--width N]
+            "usage: lusty [root] [--depth N] [--skip a,b] [--rows N] [--width N]
 
   root      start directory (default: current)
   --depth N listing depth (default 2)
@@ -78,7 +78,7 @@ command-line flags win.
         );
         return;
     }
-    // Interactive picker: lusty-native [root] [--depth N] [--skip a,b]
+    // Interactive picker: lusty [root] [--depth N] [--skip a,b]
     // [--rows N] [--width N]
     let mut root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let mut depth = 2usize;
@@ -163,7 +163,7 @@ command-line flags win.
     match app.run() {
         Ok(code) => std::process::exit(code),
         Err(err) => {
-            eprintln!("lusty-native: {err}");
+            eprintln!("lusty: {err}");
             std::process::exit(2);
         }
     }

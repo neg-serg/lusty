@@ -1,7 +1,7 @@
-# lusty-native
+# lusty
 
 Native file/buffer picker for Neovim: a fast Rust listing backend
-(`lusty-native serve` over a plain-text line protocol) plus a standalone
+(`lusty serve` over a plain-text line protocol) plus a standalone
 terminal UI (raw-mode, eza-style).
 
 Succeeds the original Vim [LustyExplorer](https://github.com/sjbach/Lusty)
@@ -29,13 +29,13 @@ parallel walker, LS_COLORS coloring and metadata views.
 cargo build --release
 ```
 
-Nix: `nix build .#lusty-native` (via `default.nix`,
+Nix: `nix build .#lusty` (via `default.nix`,
 `rustPlatform.buildRustPackage`).
 
 ## Standalone usage
 
 ```
-lusty-native [root] [--depth N] [--skip a,b] [--rows N] [--width N]
+lusty [root] [--depth N] [--skip a,b] [--rows N] [--width N]
             [--long] [--sort name|ext|size|time] [--reverse] [--dirs-first]
             [--columns perm,user,size,time]
 ```

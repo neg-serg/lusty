@@ -1,5 +1,5 @@
 {
-  description = "lusty-native: native file/buffer picker for Neovim (serve backend + standalone TUI)";
+  description = "lusty: native file/buffer picker for Neovim (serve backend + standalone TUI)";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
@@ -13,7 +13,7 @@
     {
       packages.${system} = {
         default = pkgs.callPackage ./default.nix { };
-        lusty-native = self.packages.${system}.default;
+        lusty = self.packages.${system}.default;
       };
     };
 }

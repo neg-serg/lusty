@@ -51,7 +51,7 @@ fn state_dir() -> Option<PathBuf> {
                 .ok()
                 .map(|h| PathBuf::from(h).join(".local/state"))
         })?;
-    Some(base.join("lusty-native"))
+    Some(base.join("lusty"))
 }
 
 /// FNV-1a over the listing key: root, depth, skip list, dots flag.
