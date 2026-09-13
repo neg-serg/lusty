@@ -62,6 +62,15 @@ fn until_e(lines: &mut std::io::Lines<BufReader<std::process::ChildStdout>>) -> 
     out
 }
 
+/// Consume the ready banner: the "C ..." line plus the "X <caps>" capability
+/// line that precedes any response.
+fn read_banner(lines: &mut std::io::Lines<BufReader<std::process::ChildStdout>>) -> String {
+    let c = lines.next().expect("C line").expect("read C line");
+    let x = lines.next().expect("X line").expect("read X line");
+    assert_eq!(x, "X preview", "capability line");
+    c
+}
+
 fn ask(stdin: &mut ChildStdin, req: &str) {
     writeln!(stdin, "{req}").unwrap();
     stdin.flush().unwrap();
@@ -95,6 +104,7 @@ fn serve_lists_all_on_empty_first_query() {
     let (mut child, mut stdin, mut lines) = spawn(&dir);
     let c = lines.next().unwrap().unwrap();
     assert!(c.starts_with("C 2 1 "), "C line: {c}");
+    assert_eq!(lines.next().unwrap().unwrap(), "X preview");
 
     ask(&mut stdin, "Q\t0\t50\t");
     let resp = until_e(&mut lines);
@@ -123,7 +133,7 @@ fn serve_lists_all_on_empty_first_query() {
 fn serve_m_returns_meta_per_index() {
     let dir = root_dir();
     let (mut child, mut stdin, mut lines) = spawn(&dir);
-    let _ = lines.next().unwrap().unwrap(); // C line
+    let _ = read_banner(&mut lines);
 
     ask(&mut stdin, "Q\t0\t50\t");
     let resp = until_e(&mut lines);
@@ -239,7 +249,7 @@ fn serve_q_sort_cycles_and_resets() {
     // always start from that canonical order (no stacking of sorts).
     let dir = sorted_dir();
     let (mut child, mut stdin, mut lines) = spawn(&dir);
-    let _ = lines.next().unwrap().unwrap(); // C line
+    let _ = read_banner(&mut lines);
 
     let name = ask_q(&mut stdin, &mut lines, 0);
     assert_eq!(name, vec!["a.txt", "mm.md", "z.txt"]);

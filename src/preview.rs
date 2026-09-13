@@ -47,8 +47,8 @@ pub fn is_man_source(path: &Path) -> bool {
         base = b;
     }
     let ext = base.rsplit('.').next().unwrap_or("");
-    let by_ext = (ext.len() == 1 && ext != "0" && ext.as_bytes()[0].is_ascii_digit())
-        || ext == "man";
+    let by_ext =
+        (ext.len() == 1 && ext != "0" && ext.as_bytes()[0].is_ascii_digit()) || ext == "man";
     if by_ext {
         return true;
     }
@@ -92,22 +92,69 @@ pub fn render(path: &Path, is_dir: bool, width: usize, height: usize) -> Pane {
             lines: man_lines(path),
         };
     }
-    match git_root(path.parent().unwrap_or(path)) {
-        Some(repo) => Pane {
+    // A file with unstaged changes shows the diff; otherwise (clean file, no
+    // work tree, untracked) show the file content, which is what a picker
+    // preview is expected to show.
+    if let Some(repo) = git_root(path.parent().unwrap_or(path)) {
+        let diff = git_diff_lines(path, &repo);
+        let clean = diff.len() == 1
+            && matches!(
+                diff[0].as_str(),
+                "(no unstaged changes)" | "(git diff failed)"
+            );
+        return Pane {
             dim: true,
-            lines: git_diff_lines(path, &repo),
-        },
-        None => Pane {
-            dim: true,
-            lines: vec!["(no preview: not a git work tree)".to_string()],
-        },
+            lines: if clean {
+                content_lines(path, height)
+            } else {
+                diff
+            },
+        };
+    }
+    Pane {
+        dim: true,
+        lines: content_lines(path, height),
+    }
+}
+
+/// Largest slice read for the content preview.
+const MAX_TEXT_BYTES: usize = 256 * 1024;
+
+/// First `height` lines of a text file (lossy UTF-8, trailing spaces trimmed).
+/// A NUL byte in the head marks binary content, which gets a placeholder
+/// instead of terminal garbage.
+fn content_lines(path: &Path, height: usize) -> Vec<String> {
+    use std::io::Read;
+    let Ok(mut f) = std::fs::File::open(path) else {
+        return vec!["(unreadable)".to_string()];
+    };
+    let mut buf = vec![0u8; MAX_TEXT_BYTES];
+    let n = f.read(&mut buf).unwrap_or(0);
+    buf.truncate(n);
+    if buf.iter().take(4096).any(|&b| b == 0) {
+        let size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(n as u64);
+        return vec![format!("(binary file, {size} bytes)")];
+    }
+    let text = String::from_utf8_lossy(&buf);
+    let lines: Vec<String> = text
+        .lines()
+        .take(height)
+        .map(|l| l.trim_end().to_string())
+        .collect();
+    if lines.is_empty() {
+        vec!["(empty file)".to_string()]
+    } else {
+        lines
     }
 }
 
 fn image_lines(path: &Path, width: usize, height: usize) -> Vec<String> {
     let len = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
     if len > max_image_bytes() {
-        return vec![format!("(image is {} bytes > LUSTY_PREVIEW_MAX_BYTES)", len)];
+        return vec![format!(
+            "(image is {} bytes > LUSTY_PREVIEW_MAX_BYTES)",
+            len
+        )];
     }
     let size = format!("{}x{}", width.max(1), height.max(1));
     let out = Command::new("chafa")
@@ -220,5 +267,31 @@ mod tests {
         let root = git_root(&tmp.join("a/b"));
         assert_eq!(root, Some(tmp.clone()));
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn text_file_renders_its_content() {
+        let dir = std::env::temp_dir().join(format!("lusty_prev_text_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("note.txt");
+        std::fs::write(&file, b"first line\nsecond line\nthird line\n").unwrap();
+
+        // No .git anywhere above the temp dir, so the fallback is the content.
+        let pane = render(&file, false, 40, 2);
+        assert!(pane.dim);
+        assert_eq!(pane.lines, vec!["first line", "second line"]);
+
+        // Binary content is a placeholder, not raw bytes.
+        let bin = dir.join("blob.bin");
+        std::fs::write(&bin, [0u8, 1, 2, 3]).unwrap();
+        let pane = render(&bin, false, 40, 4);
+        assert!(
+            pane.lines[0].starts_with("(binary file"),
+            "{:?}",
+            pane.lines
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

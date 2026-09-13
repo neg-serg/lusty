@@ -11,7 +11,8 @@ fn root_dir() -> std::path::PathBuf {
     // shared pid-based path made them race.
     static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let dir = std::env::temp_dir().join(format!("lusty_serve_dirs_rev_{}_{}", std::process::id(), n));
+    let dir =
+        std::env::temp_dir().join(format!("lusty_serve_dirs_rev_{}_{}", std::process::id(), n));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(dir.join("zeta_dir")).unwrap();
     std::fs::write(dir.join("alpha.txt"), b"hello").unwrap();
@@ -20,7 +21,13 @@ fn root_dir() -> std::path::PathBuf {
     dir
 }
 
-fn spawn(dir: &Path) -> (Child, ChildStdin, std::io::Lines<BufReader<std::process::ChildStdout>>) {
+fn spawn(
+    dir: &Path,
+) -> (
+    Child,
+    ChildStdin,
+    std::io::Lines<BufReader<std::process::ChildStdout>>,
+) {
     let mut child = Command::new(env!("CARGO_BIN_EXE_lusty"))
         .arg("serve")
         .arg(dir)
@@ -79,6 +86,7 @@ fn q_dirs_first_groups_dirs() {
     let dir = root_dir();
     let (mut child, mut stdin, mut lines) = spawn(&dir);
     let _ = lines.next().unwrap().unwrap(); // C line
+    let _ = lines.next().unwrap().unwrap(); // X capability line
 
     ask(&mut stdin, "Q\t0\t50\t\t0\t1\t0"); // sort 0, dirs_first
     let resp = until_e(&mut lines);
@@ -104,6 +112,7 @@ fn q_reverse_reverses_depth_group() {
     let dir = root_dir();
     let (mut child, mut stdin, mut lines) = spawn(&dir);
     let _ = lines.next().unwrap().unwrap(); // C line
+    let _ = lines.next().unwrap().unwrap(); // X capability line
 
     ask(&mut stdin, "Q\t0\t50\t\t0\t0\t1"); // sort 0, reverse
     let resp = until_e(&mut lines);
@@ -121,6 +130,7 @@ fn q_flags_inert_for_other_sorts() {
     let dir = root_dir();
     let (mut child, mut stdin, mut lines) = spawn(&dir);
     let _ = lines.next().unwrap().unwrap(); // C line
+    let _ = lines.next().unwrap().unwrap(); // X capability line
 
     ask(&mut stdin, "Q\t0\t50\t\t1\t0\t0"); // ext sort, no flags
     let plain_resp = until_e(&mut lines);

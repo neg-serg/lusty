@@ -25,6 +25,16 @@
 //!                            client after the banner. With a non-empty map
 //!                            the empty query orders the higher-scored paths
 //!                            first inside each depth level.
+//!   V <index> <w> <h>      -> "V <lines> <dim>", then one "L <text>" per row,
+//!                            then "E": preview pane text for the nvim float
+//!                            (ANSI stripped, clipped to <w>). The "L " prefix
+//!                            keeps a content line equal to "E" from ending
+//!                            the response early.
+//!
+//! The server also prints `X preview` right after the ready banner. The nvim
+//! client sends `V` only when it has seen that capability, so a client with an
+//! older backend leaves the preview key as a no-op instead of stalling the
+//! response FIFO.
 //!
 //! kind is one of d/f/l (dir/file/link). Lines are '\n'-terminated; labels
 //! and metadata are raw (no ANSI). Backslash, TAB and LF inside a label or
@@ -91,6 +101,44 @@ fn unescape_bytes(s: &str) -> Vec<u8> {
     out
 }
 
+/// Preview text for an nvim buffer: drop ANSI escape sequences (chafa art is
+/// colour-only — the shapes survive), turn TAB into a space and drop other
+/// control bytes (`nvim_buf_set_lines` rejects raw LF and renders the rest as
+/// garbage), then clip to `width` characters.
+fn plain_line(s: &str, width: usize) -> String {
+    let mut out = String::with_capacity(s.len().min(width * 4));
+    let mut chars = s.chars().peekable();
+    let mut vis = 0usize;
+    while let Some(c) = chars.next() {
+        if c == '\x1b' {
+            if chars.peek() == Some(&'[') {
+                chars.next();
+                for n in chars.by_ref() {
+                    if ('\x40'..='\x7e').contains(&n) {
+                        break;
+                    }
+                }
+            } else {
+                let _ = chars.next();
+            }
+            continue;
+        }
+        if vis >= width {
+            continue;
+        }
+        if c == '\t' {
+            out.push(' ');
+            vis += 1;
+        } else if c.is_control() {
+            continue;
+        } else {
+            out.push(c);
+            vis += 1;
+        }
+    }
+    out
+}
+
 pub fn serve(
     root: PathBuf,
     depth: usize,
@@ -119,6 +167,9 @@ pub fn serve(
         let _ = std::fs::write(&db, format!("entries={} C-about-to-print", entries.len()));
     }
     writeln!(out, "C {} {} {}", entries.len(), depth, root.display())?;
+    // Capability line: the nvim client only sends `V` when it has seen it, so
+    // an older server (no X line) makes the preview key a no-op.
+    writeln!(out, "X preview")?;
     out.flush()?;
     if let Ok(db) = std::env::var("LUSTY_SERVE_DEBUG") {
         let mut f = std::fs::OpenOptions::new().append(true).open(&db).unwrap();
@@ -268,6 +319,49 @@ pub fn serve(
                             crate::listing::meta_line(&e.path(&root), mask).unwrap_or_default();
                         writeln!(out, "K {} {}", i, meta)?;
                     }
+                }
+                writeln!(out, "E")?;
+                out.flush()?;
+            }
+            "V" => {
+                // Preview pane for the nvim float: "V\t<index>\t<w>\t<h>" ->
+                // "V <lines> <dim>", one "L <text>" per row, then "E". The
+                // "L " prefix keeps a content line equal to "E" from ending
+                // the response early.
+                let i: usize = parts
+                    .get(1)
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(usize::MAX);
+                let w: usize = parts
+                    .get(2)
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(40)
+                    .clamp(8, 400);
+                let h: usize = parts
+                    .get(3)
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(12)
+                    .clamp(1, 200);
+                let pane = if i < entries.len() {
+                    let e = &entries[i];
+                    crate::preview::render(&e.path(&root), e.kind == FileKind::Dir, w, h)
+                } else {
+                    crate::preview::Pane {
+                        dim: true,
+                        lines: Vec::new(),
+                    }
+                };
+                let lines: Vec<String> = pane
+                    .lines
+                    .iter()
+                    .take(h)
+                    .map(|l| plain_line(l, w))
+                    .collect();
+                writeln!(out, "V {} {}", lines.len(), u8::from(pane.dim))?;
+                for l in &lines {
+                    out.write_all(b"L ")?;
+                    out.write_all(l.as_bytes())?;
+                    out.write_all(b"\n")?;
                 }
                 writeln!(out, "E")?;
                 out.flush()?;

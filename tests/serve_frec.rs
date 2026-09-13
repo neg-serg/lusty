@@ -98,6 +98,7 @@ fn frecency_orders_the_empty_query_within_depth() {
     let dir = root_dir();
     let (mut child, mut stdin, mut lines) = spawn(&dir);
     let _ = lines.next().unwrap().unwrap(); // C banner
+    let _ = lines.next().unwrap().unwrap(); // X capability line
 
     // No F yet: canonical (depth, name) order.
     send(&mut stdin, "Q\t0\t50\t");

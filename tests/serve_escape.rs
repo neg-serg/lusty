@@ -91,6 +91,8 @@ fn serve_escapes_special_and_non_utf8_names() {
     let (mut child, mut stdin, mut reader) = spawn(&dir);
     let banner = read_raw_line(&mut reader).expect("C line");
     assert!(banner.starts_with(b"C 4 1 "), "banner: {banner:?}");
+    let caps = read_raw_line(&mut reader).expect("X line");
+    assert_eq!(caps, b"X preview", "capability line");
 
     writeln!(stdin, "Q\t0\t50\t").unwrap();
     stdin.flush().unwrap();

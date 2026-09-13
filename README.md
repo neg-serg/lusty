@@ -23,7 +23,8 @@ parallel walker, LS_COLORS coloring and metadata views.
   terminal buffer involved, so it renders reliably even inside a web xterm
 - Neovim float client: `C-l` toggles the long view (metadata via the `M`
   request, fetched only for visible rows), `C-y` cycles the sort order,
-  `C-s`/sort keys follow the config, `C-Space` marks files (multi-select)
+  `C-s`/sort keys follow the config, `C-Space` marks files (multi-select),
+  `C-r` toggles the preview pane (file content / git diff / man / chafa art)
 - Frecency-aware empty query: the client ships its open-frequency journal with
   `F` records and the listing puts the higher-scored paths first inside each
   depth level (disable with `LUSTY_FRECENCY=0` / `g:LustyExplorerFrecency=0`)
@@ -56,10 +57,12 @@ Plain lines on stdin/stdout, one request per line:
 
 ```
 C <total> <depth> <root>          ready banner
+X preview                         capability line (right after the banner)
 Q <from> <to> <query> [sort]      -> N <matched>, W <maxw>, R rows, E
 M <mask> <index>...               -> K <index> <meta> per index, E
 D                                 -> top-level dirs (for '/' completion), E
 F <score> <path>                  frecency record, no reply
+V <index> <w> <h>                 -> V <lines> <dim>, one "L <text>" per row, E
 ```
 
 `sort`: 0 name, 1 ext, 2 size (desc), 3 time (desc). `meta` mask bits:
@@ -76,16 +79,23 @@ With at least one `F` record the empty query orders by (depth, frecency score,
 canonical index): the shallower depth contract stays, and inside a depth the
 most frequent/recent paths lead.
 
+`V` renders the preview pane: a file with unstaged changes shows the git diff, a
+clean file (or one outside a work tree) shows its content, images show chafa art
+(ANSI stripped so the float buffer shows the shapes) and man sources show the
+rendered page. Rows are prefixed with `L ` so a content line equal to `E` cannot
+end the response early; the client only sends `V` after seeing `X preview`.
+
 ## Tests
 
 ```
 cargo test
 ```
 
-Unit tests cover ranking/colors/listing/cache; `tests/serve_m.rs` exercises
-the real binary over pipes (ranking memo, metadata requests, sort cycling),
-`tests/serve_escape.rs` covers the escaping and non-UTF8 path round-trip and
-`tests/serve_frec.rs` the frecency-ordered empty query.
+Unit tests cover ranking/colors/listing/cache/preview; `tests/serve_m.rs`
+exercises the real binary over pipes (ranking memo, metadata requests, sort
+cycling), `tests/serve_escape.rs` covers the escaping and non-UTF8 path
+round-trip, `tests/serve_frec.rs` the frecency-ordered empty query and
+`tests/serve_preview.rs` the `V` framing and clipping.
 
 ## License
 
