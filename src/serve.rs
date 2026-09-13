@@ -21,7 +21,10 @@
 //!                            mask bits (1 perm, 2 user, 4 size, 8 time),
 //!                            empty when the stat fails. The client asks only
 //!                            for rows currently visible in the float.
-//!   P <ranked-index>       -> "P <absolute path>"
+//!   F <score> <path>       -> no reply: frecency record, sent once by the
+//!                            client after the banner. With a non-empty map
+//!                            the empty query orders the higher-scored paths
+//!                            first inside each depth level.
 //!
 //! kind is one of d/f/l (dir/file/link). Lines are '\n'-terminated; labels
 //! and metadata are raw (no ANSI). Backslash, TAB and LF inside a label or
@@ -29,6 +32,7 @@
 //! break the framing; the nvim client reverses this. The process exits on
 //! stdin EOF.
 
+use std::collections::HashMap;
 use std::io::{self, BufRead, Write};
 use std::os::unix::ffi::OsStrExt;
 use std::path::PathBuf;
@@ -65,6 +69,28 @@ fn write_escaped(out: &mut impl Write, bytes: &[u8]) -> io::Result<()> {
     Ok(())
 }
 
+/// Reverse `write_escaped` for the client→server direction (`F` records).
+fn unescape_bytes(s: &str) -> Vec<u8> {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'\\' && i + 1 < b.len() {
+            match b[i + 1] {
+                b't' => out.push(b'\t'),
+                b'n' => out.push(b'\n'),
+                b'\\' => out.push(b'\\'),
+                c => out.push(c),
+            }
+            i += 2;
+        } else {
+            out.push(b[i]);
+            i += 1;
+        }
+    }
+    out
+}
+
 pub fn serve(
     root: PathBuf,
     depth: usize,
@@ -82,6 +108,9 @@ pub fn serve(
     // order again instead of stacking.
     let mut entries = cache::cached_list(&root, &opts);
     let mut base: Option<Vec<Entry>> = None;
+    // Frecency journal from the nvim client (absolute path bytes -> score),
+    // sent as fire-and-forget `F` records before the first `Q`.
+    let mut frec: HashMap<Vec<u8>, f64> = HashMap::new();
 
     let stdin = io::stdin();
     let stdout = io::stdout();
@@ -109,6 +138,9 @@ pub fn serve(
     let mut memo_hit = false;
     let mut memo_ranked: Vec<usize> = Vec::new();
     let mut memo_maxw: usize = 0;
+    // Frecency records can arrive after a Q (the client sends them at startup,
+    // but the order is not guaranteed); re-rank when the map grew.
+    let mut memo_frec = 0usize;
     for line in stdin.lock().lines() {
         let line = match line {
             Ok(l) => l,
@@ -118,6 +150,17 @@ pub fn serve(
         // sort token after the query.
         let parts: Vec<&str> = line.split('\t').collect();
         match parts[0] {
+            "F" => {
+                // Fire-and-forget frecency record: "F\t<score>\t<escaped path>".
+                // No reply, so it does not disturb the handler FIFO on the nvim
+                // side; the client sends the whole journal before its first Q.
+                let score: f64 = parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(0.0);
+                if score > 0.0 {
+                    if let Some(p) = parts.get(2) {
+                        frec.insert(unescape_bytes(p), score);
+                    }
+                }
+            }
             "Q" => {
                 let from: usize = parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(0);
                 let to: usize = parts.get(2).and_then(|s| s.parse().ok()).unwrap_or(0);
@@ -134,6 +177,7 @@ pub fn serve(
                     || sort != memo_sort
                     || dirs_first != memo_dirs
                     || reverse != memo_rev
+                    || frec.len() != memo_frec
                 {
                     memo_hit = true;
                     if sort != memo_sort || dirs_first != memo_dirs || reverse != memo_rev {
@@ -156,18 +200,23 @@ pub fn serve(
                         memo_rev = reverse;
                     }
                     let (ranked, maxw) = if query.is_empty() {
-                        let mw = entries
-                            .iter()
-                            .map(|e| e.label.chars().count())
-                            .max()
-                            .unwrap_or(0);
-                        ((0..entries.len()).collect(), mw)
+                        if frec.is_empty() {
+                            let mw = entries
+                                .iter()
+                                .map(|e| e.label.chars().count())
+                                .max()
+                                .unwrap_or(0);
+                            ((0..entries.len()).collect(), mw)
+                        } else {
+                            rank::order_by_frecency(&entries, &root, &frec)
+                        }
                     } else {
                         rank::rank_indices_mw(&entries, &query)
                     };
                     memo_q = query.clone();
                     memo_ranked = ranked;
                     memo_maxw = maxw;
+                    memo_frec = frec.len();
                 }
                 let ranked = &memo_ranked;
                 writeln!(out, "N {}", ranked.len())?;

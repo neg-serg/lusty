@@ -8,6 +8,8 @@
 
 use crate::fuzzy;
 use crate::listing::Entry;
+use std::collections::HashMap;
+use std::path::Path;
 
 /// Filter and rank entries for a typed query, returning indices into the
 /// slice (the TUI keeps one cached listing and re-ranks per keystroke without
@@ -110,6 +112,48 @@ pub fn rank_indices_mw(entries: &[Entry], query: &str) -> (Vec<usize>, usize) {
             .then_with(|| a.basename().cmp(b.basename()))
     });
     (out.into_iter().map(|(i, _)| i).collect(), maxw)
+}
+
+/// Empty-query ordering with frecency: the shallower depth stays first (the
+/// picker's "less nested wins" contract, so Enter does not jump into a
+/// subdirectory), then the most frequent/recent paths, then the canonical
+/// (depth, name) order the listing already has. Paths absent from the map keep
+/// their canonical position within their depth group.
+pub fn order_by_frecency(
+    entries: &[Entry],
+    root: &Path,
+    frec: &HashMap<Vec<u8>, f64>,
+) -> (Vec<usize>, usize) {
+    use std::os::unix::ffi::OsStrExt;
+    let scores: Vec<f64> = entries
+        .iter()
+        .map(|e| {
+            frec.get(e.path(root).as_os_str().as_bytes())
+                .copied()
+                .filter(|s| *s > 0.0)
+                .unwrap_or(0.0)
+        })
+        .collect();
+    let mut idx: Vec<usize> = (0..entries.len()).collect();
+    // `sort_by` is stable, and the listing is already in canonical order, so
+    // equal (depth, score) keys keep it.
+    idx.sort_by(|&a, &b| {
+        entries[a]
+            .depth
+            .cmp(&entries[b].depth)
+            .then_with(|| {
+                scores[b]
+                    .partial_cmp(&scores[a])
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .then_with(|| a.cmp(&b))
+    });
+    let maxw = entries
+        .iter()
+        .map(|e| e.label.chars().count())
+        .max()
+        .unwrap_or(0);
+    (idx, maxw)
 }
 
 #[cfg(test)]
@@ -217,6 +261,41 @@ mod tests {
         assert_eq!(idxs.len(), 1);
         assert_eq!(e[idxs[0]].kind, FileKind::File);
         assert_eq!(e[idxs[0]].label, "sub/gamma.txt");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn frecency_orders_within_depth() {
+        use std::os::unix::ffi::OsStrExt;
+        let dir = fixture("frec");
+        let e = entries(&dir);
+        let mut frec: HashMap<Vec<u8>, f64> = HashMap::new();
+        let key = |p: std::path::PathBuf| p.as_os_str().as_bytes().to_vec();
+        // Beta is canonically after alpha; a high score lifts it within depth 1.
+        frec.insert(key(dir.join("beta.lua")), 10.0);
+        // Gamma is depth 2: it leads its own group but never depth 1.
+        frec.insert(key(dir.join("sub/gamma.txt")), 100.0);
+
+        let (idxs, _) = order_by_frecency(&e, &dir, &frec);
+        let pos = |label: &str| idxs.iter().position(|&i| e[i].label == label).unwrap();
+        assert!(
+            pos("beta.lua") < pos("alpha.txt"),
+            "frequent file first in its depth"
+        );
+        assert!(
+            pos("beta.lua") < pos("sub/gamma.txt"),
+            "depth 1 still beats depth 2"
+        );
+        let first_depth2 = idxs.iter().position(|&i| e[i].depth == 2).unwrap();
+        assert_eq!(pos("sub/gamma.txt"), first_depth2, "gamma leads depth 2");
+
+        // An empty map keeps the canonical listing order.
+        let (plain, _) = order_by_frecency(&e, &dir, &HashMap::new());
+        let labels: Vec<&str> = plain.iter().map(|&i| e[i].label.as_str()).collect();
+        assert_eq!(
+            labels,
+            vec!["alpha.txt", "beta.lua", "pic.jpg", "sub", "sub/gamma.txt"]
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 }

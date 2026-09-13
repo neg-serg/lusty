@@ -21,7 +21,10 @@ parallel walker, LS_COLORS coloring and metadata views.
   terminal buffer involved, so it renders reliably even inside a web xterm
 - Neovim float client: `C-l` toggles the long view (metadata via the `M`
   request, fetched only for visible rows), `C-y` cycles the sort order,
-  `C-s`/sort keys follow the config
+  `C-s`/sort keys follow the config, `C-Space` marks files (multi-select)
+- Frecency-aware empty query: the client ships its open-frequency journal with
+  `F` records and the listing puts the higher-scored paths first inside each
+  depth level (disable with `LUSTY_FRECENCY=0` / `g:LustyExplorerFrecency=0`)
 
 ## Build
 
@@ -53,6 +56,7 @@ C <total> <depth> <root>          ready banner
 Q <from> <to> <query> [sort]      -> N <matched>, W <maxw>, R rows, E
 M <mask> <index>...               -> K <index> <meta> per index, E
 D                                 -> top-level dirs (for '/' completion), E
+F <score> <path>                  frecency record, no reply
 ```
 
 `sort`: 0 name, 1 ext, 2 size (desc), 3 time (desc). `meta` mask bits:
@@ -62,7 +66,12 @@ the client never joins paths itself.
 Backslash, TAB and LF inside a label, a path or a `D` name are escaped as
 `\\`, `\t`, `\n`, so a file name containing them cannot break the framing.
 Paths travel as raw Unix bytes: a name that is not valid UTF-8 is still
-openable (the label, used for display only, is the lossy form).
+openable (the label, used for display only, is the lossy form). `F` records use
+the same escaping in the client-to-server direction.
+
+With at least one `F` record the empty query orders by (depth, frecency score,
+canonical index): the shallower depth contract stays, and inside a depth the
+most frequent/recent paths lead.
 
 ## Tests
 
@@ -71,8 +80,9 @@ cargo test
 ```
 
 Unit tests cover ranking/colors/listing/cache; `tests/serve_m.rs` exercises
-the real binary over pipes (ranking memo, metadata requests, sort cycling) and
-`tests/serve_escape.rs` covers the escaping and non-UTF8 path round-trip.
+the real binary over pipes (ranking memo, metadata requests, sort cycling),
+`tests/serve_escape.rs` covers the escaping and non-UTF8 path round-trip and
+`tests/serve_frec.rs` the frecency-ordered empty query.
 
 ## License
 
