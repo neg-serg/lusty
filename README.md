@@ -41,7 +41,8 @@ lusty [root] [--depth N] [--skip a,b] [--rows N] [--width N]
 ```
 
 Enter/Tab opens, C-t/C-o/C-v open in tabs/splits, C-n/C-p move, C-u clears,
-Esc/C-c/C-g cancels, C-l toggles the long view, C-y cycles the sort order.
+Esc/C-c/C-g cancels, C-l toggles the long view. The sort order is set by
+`--sort` at startup (the nvim float cycles it with C-y).
 
 ## serve protocol
 
@@ -59,6 +60,11 @@ P <index>                         -> P <absolute path>
 1 perm, 2 user, 4 size, 8 time. Rows carry absolute paths after a tab, so
 the client never joins paths itself.
 
+Backslash, TAB and LF inside a label, a path or a `D` name are escaped as
+`\\`, `\t`, `\n`, so a file name containing them cannot break the framing.
+Paths travel as raw Unix bytes: a name that is not valid UTF-8 is still
+openable (the label, used for display only, is the lossy form).
+
 ## Tests
 
 ```
@@ -66,7 +72,8 @@ cargo test
 ```
 
 Unit tests cover ranking/colors/listing/cache; `tests/serve_m.rs` exercises
-the real binary over pipes (ranking memo, metadata requests, sort cycling).
+the real binary over pipes (ranking memo, metadata requests, sort cycling) and
+`tests/serve_escape.rs` covers the escaping and non-UTF8 path round-trip.
 
 ## License
 
