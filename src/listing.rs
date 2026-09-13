@@ -470,7 +470,7 @@ pub fn sort_by_meta(root: &Path, entries: &mut Vec<Entry>, by_time: bool) {
 }
 
 /// eza --sort=ext: group each depth by extension, then name.
-pub fn sort_by_ext(entries: &mut Vec<Entry>) {
+pub fn sort_by_ext(entries: &mut [Entry]) {
     let n = entries.len();
     let mut i = 0;
     while i < n {
@@ -491,7 +491,7 @@ pub fn sort_by_ext(entries: &mut Vec<Entry>) {
 /// Apply eza-style ordering tweaks on top of the canonical (depth, name)
 /// order: optionally keep directories first within each depth and/or reverse
 /// each depth group. Deterministic, so on-disk cache reuse stays consistent.
-pub fn reorder(entries: &mut Vec<Entry>, dirs_first: bool, reverse: bool) {
+pub fn reorder(entries: &mut [Entry], dirs_first: bool, reverse: bool) {
     if !dirs_first && !reverse {
         return;
     }

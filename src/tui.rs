@@ -337,7 +337,7 @@ impl App {
             self.selected = 0;
             return;
         }
-        let columns = (n + row_count - 1) / row_count;
+        let columns = n.div_ceil(row_count);
         let cur_col = self.selected / row_count;
         let cur_row = self.selected % row_count;
         let columns_i = columns as isize;
@@ -642,9 +642,9 @@ impl App {
         let rows = self.list_rows();
         let total = self.ranked.len().max(1);
         let needed = total.div_ceil(rows).max(1);
-        let name_w = self.max_name_w().min(20).max(1);
+        let name_w = self.max_name_w().clamp(1, 20);
         let byw = ((w + 2) / (name_w + 4)).max(1);
-        needed.min(byw).min(8).max(1)
+        needed.min(byw).clamp(1, 8)
     }
 
     fn col_width(&mut self) -> usize {
@@ -1130,8 +1130,8 @@ fn load_theme() -> Theme {
     let mut section = String::new();
     for raw in content.lines() {
         let line = raw.trim();
-        if line.starts_with('[') {
-            section = line[1..].trim_end_matches(']').to_string();
+        if let Some(rest) = line.strip_prefix('[') {
+            section = rest.trim_end_matches(']').to_string();
             continue;
         }
         let Some((key, val)) = line.split_once('=') else {

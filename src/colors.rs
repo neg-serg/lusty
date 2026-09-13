@@ -72,7 +72,7 @@ impl Colors {
         let lname = name.to_ascii_lowercase();
         let mut best: Option<(usize, &str)> = None;
         for (suf, code) in &self.suffix {
-            if lname.ends_with(suf.as_str()) && best.map_or(true, |(l, _)| suf.len() >= l) {
+            if lname.ends_with(suf.as_str()) && best.is_none_or(|(l, _)| suf.len() >= l) {
                 best = Some((suf.len(), code));
             }
         }

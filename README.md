@@ -24,7 +24,8 @@ parallel walker, LS_COLORS coloring and metadata views.
 - Neovim float client: `C-l` toggles the long view (metadata via the `M`
   request, fetched only for visible rows), `C-y` cycles the sort order,
   `C-s`/sort keys follow the config, `C-Space` marks files (multi-select),
-  `C-r` toggles the preview pane (file content / git diff / man / chafa art)
+  `C-r` toggles the preview pane (file content / git diff / man / colour chafa
+  art via SGR→extmarks)
 - Frecency-aware empty query: the client ships its open-frequency journal with
   `F` records and the listing puts the higher-scored paths first inside each
   depth level (disable with `LUSTY_FRECENCY=0` / `g:LustyExplorerFrecency=0`)
@@ -81,9 +82,11 @@ most frequent/recent paths lead.
 
 `V` renders the preview pane: a file with unstaged changes shows the git diff, a
 clean file (or one outside a work tree) shows its content, images show chafa art
-(ANSI stripped so the float buffer shows the shapes) and man sources show the
-rendered page. Rows are prefixed with `L ` so a content line equal to `E` cannot
-end the response early; the client only sends `V` after seeing `X preview`.
+and man sources show the rendered page. SGR sequences are passed through (the
+nvim client turns them into extmarks, so chafa art is coloured); other ANSI
+escapes are dropped and rows are clipped by visible characters. Rows are
+prefixed with `L ` so a content line equal to `E` cannot end the response early;
+the client only sends `V` after seeing `X preview`.
 
 ## Tests
 
@@ -95,7 +98,18 @@ Unit tests cover ranking/colors/listing/cache/preview; `tests/serve_m.rs`
 exercises the real binary over pipes (ranking memo, metadata requests, sort
 cycling), `tests/serve_escape.rs` covers the escaping and non-UTF8 path
 round-trip, `tests/serve_frec.rs` the frecency-ordered empty query and
-`tests/serve_preview.rs` the `V` framing and clipping.
+`tests/serve_preview.rs` the `V` framing and clipping. CI (GitHub Actions) runs
+`cargo fmt --check`, `cargo clippy --all-targets -- -D warnings` and `cargo test`.
+
+## Benchmarks
+
+```
+scripts/bench.sh                 # repo + /etc/nixos at depth 2
+BENCH_ROOTS=/nix/store scripts/bench.sh
+```
+
+Uses `hyperfine` when present (falls back to a millisecond loop) over
+`lusty --list`, which is the listing path without the terminal UI.
 
 ## License
 
