@@ -24,9 +24,13 @@
 //!   P <ranked-index>       -> "P <absolute path>"
 //!
 //! kind is one of d/f/l (dir/file/link). Lines are '\n'-terminated; labels
-//! and metadata are raw (no ANSI). The process exits on stdin EOF.
+//! and metadata are raw (no ANSI). Backslash, TAB and LF inside a label or
+//! path are escaped as `\\`, `\t`, `\n` so a file name containing them cannot
+//! break the framing; the nvim client reverses this. The process exits on
+//! stdin EOF.
 
 use std::io::{self, BufRead, Write};
+use std::os::unix::ffi::OsStrExt;
 use std::path::PathBuf;
 
 use crate::cache;
@@ -43,6 +47,22 @@ fn apply_sort(entries: &mut Vec<Entry>, root: &std::path::Path, sort: u8) {
         3 => crate::listing::sort_by_meta(root, entries, true),
         _ => {}
     }
+}
+
+/// Escape a raw byte string for the line protocol: backslash, TAB and LF
+/// become the two-byte sequences `\\`, `\t`, `\n`, so a file name containing
+/// them cannot break the request/response framing. The nvim client reverses
+/// this (`unescape` in native.lua). Bytes, not `str`: names may be non-UTF8.
+fn write_escaped(out: &mut impl Write, bytes: &[u8]) -> io::Result<()> {
+    for &b in bytes {
+        match b {
+            b'\\' => out.write_all(b"\\\\")?,
+            b'\t' => out.write_all(b"\\t")?,
+            b'\n' => out.write_all(b"\\n")?,
+            _ => out.write_all(&[b])?,
+        }
+    }
+    Ok(())
 }
 
 pub fn serve(
@@ -160,14 +180,11 @@ pub fn serve(
                         FileKind::Link => 'l',
                         _ => 'f',
                     };
-                    writeln!(
-                        out,
-                        "R {} {} {}\t{}",
-                        i,
-                        kind,
-                        e.label,
-                        e.path(&root).display()
-                    )?;
+                    write!(out, "R {} {} ", i, kind)?;
+                    write_escaped(&mut out, e.label.as_bytes())?;
+                    out.write_all(b"\t")?;
+                    write_escaped(&mut out, e.path(&root).as_os_str().as_bytes())?;
+                    out.write_all(b"\n")?;
                 }
                 writeln!(out, "E")?;
                 out.flush()?;
@@ -176,7 +193,9 @@ pub fn serve(
                 // top-level directories (depth 1) for '/' completion
                 for e in &entries {
                     if e.depth == 1 && e.kind == FileKind::Dir {
-                        writeln!(out, "D {}", e.basename())?;
+                        out.write_all(b"D ")?;
+                        write_escaped(&mut out, e.raw_basename())?;
+                        out.write_all(b"\n")?;
                     }
                 }
                 writeln!(out, "E")?;
@@ -185,7 +204,9 @@ pub fn serve(
             "P" => {
                 let i: usize = parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(0);
                 if i < entries.len() {
-                    writeln!(out, "P {}", entries[i].path(&root).display())?;
+                    out.write_all(b"P ")?;
+                    write_escaped(&mut out, entries[i].path(&root).as_os_str().as_bytes())?;
+                    out.write_all(b"\n")?;
                 } else {
                     writeln!(out, "P ")?;
                 }

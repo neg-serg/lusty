@@ -102,11 +102,12 @@ pub struct App {
     dirs_first: bool,        // eza --group-dirs-first
     sort_mode: u8,           // 0 name, 1 ext, 2 size, 3 time
     cols_mask: u8,           // long view fields: 1 perm, 2 user, 4 size, 8 time
+    maxw: usize,             // widest label (chars) in the current listing
     palette: Colors,
-    preview_on: bool,        // right preview pane (C-Space / Shift+P toggles)
-    preview_w: usize,        // pane width in columns
-    pane_kind: u8,           // 0 off, 1 dim text (git/man/info), 2 chafa art
-    pane: Vec<String>,       // pre-clipped pane rows (preview_w wide)
+    preview_on: bool,         // right preview pane (C-Space / Shift+P toggles)
+    preview_w: usize,         // pane width in columns
+    pane_kind: u8,            // 0 off, 1 dim text (git/man/info), 2 chafa art
+    pane: Vec<String>,        // pre-clipped pane rows (preview_w wide)
     pane_key: Option<String>, // cache key: path + size + geometry
 }
 
@@ -138,6 +139,7 @@ impl App {
             dirs_first: false,
             sort_mode: 0,
             cols_mask: 15,
+            maxw: 0,
             palette,
             preview_on: false,
             preview_w: 40,
@@ -200,12 +202,12 @@ impl App {
     /// demand and cached per root.
     fn listing(&mut self) -> &Vec<Entry> {
         let dots = self.show_dots();
-        let cache = if dots {
-            &mut self.dots
+        let is_empty = if dots {
+            self.dots.is_none()
         } else {
-            &mut self.hidden
+            self.hidden.is_none()
         };
-        if cache.is_none() {
+        if is_empty {
             let opts = Options {
                 depth: self.opts.depth,
                 skip_dirs: self.opts.skip_dirs.clone(),
@@ -219,10 +221,26 @@ impl App {
                 3 => crate::listing::sort_by_meta(&self.root, &mut listed, true),
                 _ => crate::listing::reorder(&mut listed, self.dirs_first, self.reverse),
             }
-            *cache = Some(listed);
+            // Cache the widest label once per listing: max_cols/col_width ask
+            // for it on every redraw, and a full scan per keystroke on a
+            // 150k-entry tree is pure waste.
+            self.maxw = listed
+                .iter()
+                .map(|e| e.label.chars().count())
+                .max()
+                .unwrap_or(0);
+            if dots {
+                self.dots = Some(listed);
+            } else {
+                self.hidden = Some(listed);
+            }
             self.needs_rank = true;
         }
-        cache.as_ref().unwrap()
+        if dots {
+            self.dots.as_ref().unwrap()
+        } else {
+            self.hidden.as_ref().unwrap()
+        }
     }
 
     fn ranked_len(&mut self) -> usize {
@@ -305,10 +323,13 @@ impl App {
             return;
         }
         let ql = q.to_lowercase();
-        let entries = self.listing().clone();
-        let mut cand: Option<String> = None;
+        // Take a local copy of the root instead of cloning the whole listing:
+        // on a 150k-entry tree that clone was a visible stall per '/', and the
+        // path from `Entry::path` keeps non-UTF8 directory names intact.
+        let root = self.root.clone();
+        let mut cand: Option<PathBuf> = None;
         let mut dup = false;
-        for e in entries.iter() {
+        for e in self.listing().iter() {
             if e.kind != FileKind::Dir || e.depth != 1 {
                 continue;
             }
@@ -317,16 +338,11 @@ impl App {
                 if cand.is_some() {
                     dup = true;
                 } else {
-                    cand = Some(e.basename().to_string());
+                    cand = Some(e.path(&root));
                 }
             }
         }
-        if let (Some(n), false) = (cand, dup) {
-            let path = if self.root == std::path::Path::new("/") {
-                std::path::PathBuf::from("/").join(&n)
-            } else {
-                self.root.join(&n)
-            };
+        if let (Some(path), false) = (cand, dup) {
             self.re_root(path);
             return;
         }
@@ -359,7 +375,13 @@ impl App {
         terminal::disable_raw_mode()?;
         execute!(io::stdout(), cursor::Show)?;
         let mut so = io::stdout().lock();
-        writeln!(so, "{}\t{}", action, entry.path(&self.root).display())?;
+        // Raw bytes: the consumer (shell/nvim) opens this path verbatim, so a
+        // non-UTF8 name must not go through the lossy `display()`.
+        use std::os::unix::ffi::OsStrExt;
+        so.write_all(action.as_bytes())?;
+        so.write_all(b"\t")?;
+        so.write_all(entry.path(&self.root).as_os_str().as_bytes())?;
+        so.write_all(b"\n")?;
         so.flush()?;
         std::process::exit(0);
     }
@@ -601,7 +623,7 @@ impl App {
         }
         let i = self.ranked[self.selected];
         let e = self.listing()[i].clone();
-        let path = self.root.join(&e.label);
+        let path = e.path(&self.root);
         let len = std::fs::metadata(&path).ok().map(|m| m.len());
         let rows = self.list_rows();
         let pw = self.preview_w;
@@ -611,7 +633,8 @@ impl App {
             pw,
             rows,
             e.kind == FileKind::Dir,
-            len.map(|l| l.to_string()).unwrap_or_else(|| "?".to_string())
+            len.map(|l| l.to_string())
+                .unwrap_or_else(|| "?".to_string())
         );
         if self.pane_key.as_deref() == Some(key.as_str()) {
             return;
@@ -637,14 +660,10 @@ impl App {
         self.pane_key = Some(key);
     }
 
-    /// Widest label (in chars) over the full listing of the current root.
-    fn max_name_w(&mut self) -> usize {
-        let entries = self.listing();
-        entries
-            .iter()
-            .map(|e| e.label.chars().count())
-            .max()
-            .unwrap_or(0)
+    /// Widest label (in chars) over the full listing of the current root,
+    /// cached when the listing is built (see `listing`).
+    fn max_name_w(&self) -> usize {
+        self.maxw
     }
 
     fn clamp_offset(&mut self, rows: usize) {
@@ -843,7 +862,7 @@ impl App {
                         let e = self.listing()[i].clone();
                         if self.long {
                             if let Some(m) =
-                                crate::listing::meta_line(&root_path.join(&e.label), self.cols_mask)
+                                crate::listing::meta_line(&e.path(&root_path), self.cols_mask)
                             {
                                 cell.push_str(&format!("{esc}[38;2;108;126;150m{m}"));
                                 cell.push_str(&revert);
@@ -853,8 +872,7 @@ impl App {
                         if pos == self.selected {
                             cell.push_str(&format!("{esc}[{}m", sel_style()));
                         } else {
-                            let exec =
-                                e.kind == FileKind::File && is_exec(&root_path.join(&e.label));
+                            let exec = e.kind == FileKind::File && is_exec(&e.path(&root_path));
                             if let Some(code) = self.palette.code_for(e.basename(), e.kind, exec) {
                                 cell.push_str(&format!("{esc}[{code}m"));
                             }
@@ -1087,7 +1105,6 @@ fn sel_style() -> String {
     s
 }
 
-
 /// Byte range of the first plain case-insensitive occurrence of `query` in
 /// the basename of `label`, or None. Like the nvim float, a query starting
 /// with '.' (dot-toggle) is ignored; non-ASCII labels are skipped so the
@@ -1096,7 +1113,10 @@ fn query_match(label: &str, query: &str) -> Option<(usize, usize)> {
     if query.is_empty() || query.starts_with('.') || !label.is_ascii() {
         return None;
     }
-    let base_len = label.rfind('/').map(|i| label.len() - i - 1).unwrap_or(label.len());
+    let base_len = label
+        .rfind('/')
+        .map(|i| label.len() - i - 1)
+        .unwrap_or(label.len());
     let base_start = label.len() - base_len;
     let base = &label[base_start..];
     let q = query.to_lowercase();

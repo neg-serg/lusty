@@ -1,4 +1,4 @@
-//! On-disk listing cache for big roots (binary format, "LSTC" v1).
+//! On-disk listing cache for big roots (binary format, "LST4" v1).
 //!
 //! A listing is a pure function of the tree shape: entry names, kinds and
 //! depths. Content edits never change it, only adds/removes/renames do, and
@@ -11,8 +11,8 @@
 //!   magic "LSTC" | depth u32 | dots u8 | follow u8
 //!   mounts:  u32 count, each len u32 + bytes
 //!   dirs:    u32 count, each label-len u32 + label bytes | mtime i64 | count u64
-//!   entries: u32 count, each kind u8 | depth u32 | name-flag u8 | label-len
-//!            u32 + label bytes | (name-len u32 + name bytes when flag=1)
+//!   entries: u32 count, each kind u8 | depth u32 | name0 u8 | rel-len
+//!            u32 + rel bytes (raw Unix path bytes, lossy-decoded for display)
 //! Entry paths are not stored: they are root.join(label) again. The watch
 //! dir labels are relative to the root ("" = root itself).
 //!
@@ -30,7 +30,7 @@ const MAX_WATCH_DIRS: usize = 4096;
 /// Only bother caching trees with at least this many entries.
 const MIN_ENTRIES: usize = 16;
 
-const MAGIC: &[u8] = b"LST3";
+const MAGIC: &[u8] = b"LST4";
 
 fn cache_enabled() -> bool {
     match std::env::var("LUSTY_CACHE") {
@@ -142,6 +142,13 @@ fn put_str(out: &mut Vec<u8>, s: &str) {
     out.extend_from_slice(s.as_bytes());
 }
 
+/// Raw byte string (entry paths may be non-UTF8, so they cannot go through
+/// `put_str`).
+fn put_bytes(out: &mut Vec<u8>, b: &[u8]) {
+    put_u32(out, b.len() as u32);
+    out.extend_from_slice(b);
+}
+
 fn store(
     path: &Path,
     opts: &Options,
@@ -172,7 +179,7 @@ fn store(
         w.push(kind_char(e.kind));
         put_u32(&mut w, e.depth);
         w.push(e.name0);
-        put_str(&mut w, &e.label);
+        put_bytes(&mut w, &e.rel_bytes);
     }
     let tmp = path.with_extension("tmp");
     fs::write(&tmp, &w)?;
@@ -226,6 +233,10 @@ impl<'a> Cur<'a> {
         let b = self.take(n)?;
         Some(String::from_utf8_lossy(b).into_owned())
     }
+    fn bytes(&mut self) -> Option<Vec<u8>> {
+        let n = self.u32()? as usize;
+        Some(self.take(n)?.to_vec())
+    }
 }
 
 fn current_mounts() -> Vec<String> {
@@ -277,13 +288,8 @@ fn try_load(path: &Path, root: &Path, opts: &Options) -> Option<Vec<Entry>> {
         let kind = kind_from(c.u8()?);
         let edepth = c.u32()?;
         let name0 = c.u8()?;
-        let label = c.str()?;
-        entries.push(Entry {
-            label,
-            kind,
-            depth: edepth,
-            name0,
-        });
+        let rel = c.bytes()?;
+        entries.push(Entry::new(rel, kind, edepth, name0));
     }
     Some(entries)
 }

@@ -23,9 +23,9 @@ use rayon::prelude::*;
 use crate::glob;
 use crate::mount;
 
-/// A directory queued for one walk level: its path and its label relative to
-/// the root ("" for the root itself).
-type DirTask = (PathBuf, String);
+/// A directory queued for one walk level: its path and the raw bytes of its
+/// label relative to the root (empty for the root itself).
+type DirTask = (PathBuf, Vec<u8>);
 
 /// Parallelize a level only when it has at least this many directories;
 /// smaller trees would pay more rayon scheduling than they gain.
@@ -74,6 +74,11 @@ pub enum FileKind {
 pub struct Entry {
     /// Label shown/scored by the picker: the path relative to the root.
     pub label: String,
+    /// Raw Unix bytes of the same relative path. `label` is lossy, so a file
+    /// name that is not valid UTF-8 cannot be turned back into a path from it;
+    /// every filesystem operation goes through `path()`, which uses these
+    /// bytes. Display and scoring keep using `label`.
+    pub rel_bytes: Vec<u8>,
     pub kind: FileKind,
     /// 1 = direct child of the root, 2 = one level deeper, etc.
     pub depth: u32,
@@ -88,10 +93,33 @@ pub fn basename(label: &str) -> &str {
 }
 
 impl Entry {
+    /// Build an entry from the raw relative-path bytes; the display label is
+    /// derived lossily so construction stays in one place.
+    pub fn new(rel_bytes: Vec<u8>, kind: FileKind, depth: u32, name0: u8) -> Entry {
+        let label = String::from_utf8_lossy(&rel_bytes).into_owned();
+        Entry {
+            label,
+            rel_bytes,
+            kind,
+            depth,
+            name0,
+        }
+    }
+
     /// Full path for this entry under `root` (labels are root-relative, so
     /// the path is root.join(label)); built only where actually needed.
+    /// Uses the raw bytes, so non-UTF8 names survive the round-trip.
     pub fn path(&self, root: &Path) -> PathBuf {
-        root.join(&self.label)
+        use std::os::unix::ffi::OsStrExt;
+        root.join(Path::new(std::ffi::OsStr::from_bytes(&self.rel_bytes)))
+    }
+
+    /// Raw last component of the relative path (bytes, for the protocol).
+    pub fn raw_basename(&self) -> &[u8] {
+        match self.rel_bytes.iter().rposition(|&b| b == b'/') {
+            Some(i) => &self.rel_bytes[i + 1..],
+            None => &self.rel_bytes,
+        }
     }
 
     /// Bare entry name (last label component).
@@ -113,6 +141,31 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
     let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
     let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
     (if m <= 2 { y + 1 } else { y }, m, d)
+}
+
+/// Local (year, month, day, hour, minute) for a Unix timestamp, honoring the
+/// process timezone (`TZ`). Falls back to the UTC civil-date math when
+/// `localtime_r` fails (out-of-range timestamps). Rendering localtime matters:
+/// eza/ls show the wall clock the user expects, and the previous UTC-only math
+/// was off by the zone offset (3 h on MSK).
+fn local_parts(secs: i64) -> (i64, u32, u32, i64, i64) {
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    let t = secs as libc::time_t;
+    // SAFETY: localtime_r writes into a valid `tm` and is thread-safe.
+    let ok = unsafe { !libc::localtime_r(&t, &mut tm).is_null() };
+    if ok {
+        return (
+            tm.tm_year as i64 + 1900,
+            (tm.tm_mon + 1) as u32,
+            tm.tm_mday as u32,
+            tm.tm_hour as i64,
+            tm.tm_min as i64,
+        );
+    }
+    let days = secs.div_euclid(86400);
+    let rem = secs.rem_euclid(86400);
+    let (y, mo, d) = civil_from_days(days);
+    (y, mo, d, rem / 3600, (rem % 3600) / 60)
 }
 
 /// eza -l style metadata: "rwxr-xr-x   1000   1.2K 2026-09-04 06:40".
@@ -164,12 +217,7 @@ pub fn meta_line(path: &Path, mask: u8) -> Option<String> {
     } else {
         format!("{hs:.1}{unit}")
     };
-    let secs = md.mtime();
-    let days = secs.div_euclid(86400);
-    let rem = secs.rem_euclid(86400);
-    let (y, mo, d) = civil_from_days(days);
-    let hh = rem / 3600;
-    let mm = (rem % 3600) / 60;
+    let (y, mo, d, hh, mm) = local_parts(md.mtime());
     let mut parts: Vec<String> = Vec::new();
     if mask & 1 != 0 {
         parts.push(perms);
@@ -237,13 +285,14 @@ fn is_skip_dir(name: &str, path: &Path, skip: &[(bool, String)]) -> bool {
 /// and, when dots are hidden, dot-dirs are listed but not descended into).
 fn scan_dir(
     dir: &Path,
-    dir_rel: &str,
+    dir_rel: &[u8],
     depth: usize,
     max_depth: usize,
     skip: &[(bool, String)],
     mounts: &HashSet<String>,
     show_dots: bool,
 ) -> (Vec<Entry>, Vec<DirTask>) {
+    use std::os::unix::ffi::OsStrExt;
     let mut entries = Vec::new();
     let mut subdirs: Vec<DirTask> = Vec::new();
     let rd = match std::fs::read_dir(dir) {
@@ -255,16 +304,21 @@ fn scan_dir(
             continue;
         };
         let is_dir = ft.is_dir();
-        let name = item.file_name().to_string_lossy().into_owned();
+        let name_os = item.file_name();
+        let name = name_os.to_string_lossy();
         if name.starts_with('.') && !show_dots {
             continue; // dot-dir/dot-file: neither listed nor traversed
         }
-        let rel = if dir_rel.is_empty() {
-            name.clone()
-        } else {
-            format!("{dir_rel}/{name}")
-        };
-        let path = dir.join(&name);
+        // Raw bytes, not the lossy label: this is what `Entry::path` uses, so
+        // a non-UTF8 name still opens instead of turning into U+FFFD.
+        let name_bytes = name_os.as_bytes();
+        let mut rel_bytes = Vec::with_capacity(dir_rel.len() + 1 + name_bytes.len());
+        if !dir_rel.is_empty() {
+            rel_bytes.extend_from_slice(dir_rel);
+            rel_bytes.push(b'/');
+        }
+        rel_bytes.extend_from_slice(name_bytes);
+        let path = dir.join(&name_os);
         let mut descend = is_dir && depth < max_depth;
         if descend && is_skip_dir(&name, &path, skip) {
             descend = false;
@@ -278,19 +332,18 @@ fn scan_dir(
                 }
             }
         }
-        entries.push(Entry {
-            label: rel.clone(),
-            kind: kind_of(&ft),
-            depth: depth as u32,
-            name0: name
-                .as_bytes()
+        entries.push(Entry::new(
+            rel_bytes.clone(),
+            kind_of(&ft),
+            depth as u32,
+            name_bytes
                 .first()
                 .copied()
                 .unwrap_or(0)
                 .to_ascii_lowercase(),
-        });
+        ));
         if descend {
-            subdirs.push((path, rel));
+            subdirs.push((path, rel_bytes));
         }
     }
     (entries, subdirs)
@@ -318,7 +371,7 @@ pub fn list(root: &Path, opts: &Options) -> Vec<Entry> {
 
     // buckets[level - 1] collects the entries of that depth level.
     let mut buckets: Vec<Vec<Entry>> = (0..opts.depth).map(|_| Vec::new()).collect();
-    let mut level: Vec<DirTask> = vec![(root.to_path_buf(), String::new())];
+    let mut level: Vec<DirTask> = vec![(root.to_path_buf(), Vec::new())];
     let mut depth = 1usize;
     while depth <= opts.depth && !level.is_empty() {
         let results: Vec<(Vec<Entry>, Vec<DirTask>)> = if level.len() >= PAR_MIN_DIRS {
@@ -370,6 +423,7 @@ fn ext_of(label: &str) -> &str {
 fn dummy_entry() -> Entry {
     Entry {
         label: String::new(),
+        rel_bytes: Vec::new(),
         kind: FileKind::File,
         depth: 0,
         name0: 0,
@@ -480,6 +534,7 @@ fn sort_by_name(bucket: &mut Vec<Entry>) {
     for &i in &order {
         let empty = Entry {
             label: String::new(),
+            rel_bytes: Vec::new(),
             kind: FileKind::File,
             depth: 0,
             name0: 0,
@@ -579,6 +634,72 @@ mod tests {
         assert!(labels.contains(&"sub"));
         assert!(labels.contains(&"sub/deep"));
         assert!(labels.contains(&"sub/deep/foo.txt"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn non_utf8_name_keeps_a_usable_path() {
+        use std::os::unix::ffi::OsStrExt;
+        let dir = std::env::temp_dir().join("lusty_native_nonutf8_test");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let raw = std::ffi::OsStr::from_bytes(b"caf\xe9.txt");
+        let file = dir.join(raw);
+        fs::write(&file, b"x").unwrap();
+
+        let entries = list(&dir, &opts(1, vec![], false));
+        let e = entries
+            .iter()
+            .find(|e| e.raw_basename() == &b"caf\xe9.txt"[..])
+            .expect("non-UTF8 entry is listed");
+        // The lossy label is only for display; `path()` must round-trip the
+        // exact bytes so the file can be opened/stat'ed.
+        assert_ne!(e.label.as_bytes(), b"caf\xe9.txt");
+        assert_eq!(e.path(&dir), file);
+        assert!(e.path(&dir).exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn meta_line_renders_local_time() {
+        // Regression: the long view rendered UTC time-of-day (mtime modulo a
+        // day), 3 h behind eza on MSK. Force a fixed zone so the expectation
+        // does not depend on the host TZ.
+        let saved = std::env::var_os("TZ");
+        std::env::set_var("TZ", "UTC-3"); // POSIX: 3 hours east of UTC
+
+        let dir = std::env::temp_dir().join("lusty_native_meta_tz_test");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("f.txt");
+        fs::write(&file, b"x").unwrap();
+        // 2026-09-04 03:40 UTC -> 06:40 in UTC-3.
+        let secs: i64 = 1_788_493_200;
+        let ts = [
+            libc::timespec {
+                tv_sec: secs as libc::time_t,
+                tv_nsec: 0,
+            },
+            libc::timespec {
+                tv_sec: secs as libc::time_t,
+                tv_nsec: 0,
+            },
+        ];
+        let c = std::ffi::CString::new(file.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: valid C path and a two-element timespec array.
+        assert_eq!(
+            unsafe { libc::utimensat(libc::AT_FDCWD, c.as_ptr(), ts.as_ptr(), 0) },
+            0
+        );
+
+        let line = meta_line(&file, 8).expect("time field");
+
+        match saved {
+            Some(v) => std::env::set_var("TZ", v),
+            None => std::env::remove_var("TZ"),
+        }
+
+        assert_eq!(line, "2026-09-04 06:40");
         let _ = fs::remove_dir_all(&dir);
     }
 }
