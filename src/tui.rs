@@ -79,6 +79,49 @@ pub fn normalize_query_char(c: char) -> Option<char> {
     }
 }
 
+/// Where the standalone picker remembers the last typed query. `LUSTY_HISTORY`
+/// overrides the path; `LUSTY_HISTORY=0` (or `off`) disables the feature.
+fn history_file() -> Option<PathBuf> {
+    if let Ok(v) = std::env::var("LUSTY_HISTORY") {
+        let v = v.trim();
+        if v == "0" || v.eq_ignore_ascii_case("off") {
+            return None;
+        }
+        if !v.is_empty() {
+            return Some(PathBuf::from(v));
+        }
+    }
+    let base = std::env::var("XDG_STATE_HOME")
+        .map(PathBuf::from)
+        .ok()
+        .or_else(|| {
+            std::env::var("HOME")
+                .ok()
+                .map(|h| PathBuf::from(h).join(".local/state"))
+        })?;
+    Some(base.join("lusty").join("history"))
+}
+
+/// Last query from the history file (first line), or "" when absent.
+fn load_history() -> String {
+    history_file()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|s| s.lines().next().map(str::to_string))
+        .unwrap_or_default()
+}
+
+/// Persist the current query so the next run starts filtered the same way
+/// (the nvim pickers restore their last input in the same fashion).
+fn store_history(query: &str) {
+    let Some(path) = history_file() else {
+        return;
+    };
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(path, format!("{query}\n"));
+}
+
 pub struct App {
     root: PathBuf,
     opts: Options,
@@ -119,7 +162,7 @@ impl App {
             opts,
             hidden: None,
             dots: None,
-            query: String::new(),
+            query: load_history(),
             ranked: Vec::new(),
             needs_rank: true,
             selected: 0,
@@ -383,6 +426,7 @@ impl App {
         so.write_all(entry.path(&self.root).as_os_str().as_bytes())?;
         so.write_all(b"\n")?;
         so.flush()?;
+        store_history(&self.query);
         std::process::exit(0);
     }
 
@@ -431,6 +475,9 @@ impl App {
             self.pop_top = r0;
         }
         let result = self.loop_events(&mut stdout);
+        // Remember the query for the next run (cancel path; `open` stores it
+        // before its own exit).
+        store_history(&self.query);
         // Clear first, then park the cursor at the top of the popup area
         // so the shell continues directly under the command line.
         self.clear_panel(&mut stdout)?;
@@ -752,6 +799,17 @@ impl App {
                                 self.selected = 0;
                             }
                         }
+                        // C-d cycles the search depth (1..6) like the nvim
+                        // float; the listing cache is keyed by depth, so the
+                        // next draw re-lists (or hits that depth's cache).
+                        (KeyCode::Char('d'), true) => {
+                            self.opts.depth = self.opts.depth % 6 + 1;
+                            self.hidden = None;
+                            self.dots = None;
+                            self.needs_rank = true;
+                            self.selected = 0;
+                            self.offset = 0;
+                        }
                         // readline-ish: C-h = backspace, Home/End = first/last,
                         // PgUp/PgDn = one page of the grid
                         (KeyCode::Char('h'), true) => {
@@ -1013,6 +1071,12 @@ impl App {
         push_painted(&current, "38;2;149;167;188", &mut out);
         push_painted(" \u{f105} ", "38;2;0;95;175", &mut out);
         push_painted(&self.query, "1;38;2;255;255;255", &mut out);
+        // Search depth (C-d cycles it), dimmed like the border.
+        push_painted(
+            &format!("  d{}", self.opts.depth),
+            "38;2;108;126;150",
+            &mut out,
+        );
         out.push(esc);
         out.push_str("[22;23;24;39m");
         out
@@ -1258,5 +1322,33 @@ mod apad_test {
         super::ansi_pad(&mut s, 22);
         eprintln!("OUT: {:?}", s);
         eprintln!("CHARS: {:?}", s.chars().collect::<Vec<_>>());
+    }
+}
+
+#[cfg(test)]
+mod history_test {
+    #[test]
+    fn history_round_trips_and_disables() {
+        let dir = std::env::temp_dir().join("lusty_history_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("history");
+
+        std::env::set_var("LUSTY_HISTORY", &file);
+        super::store_history("sub/fi");
+        assert_eq!(super::load_history(), "sub/fi");
+
+        // Missing file reads as an empty query.
+        std::fs::remove_file(&file).unwrap();
+        assert_eq!(super::load_history(), "");
+
+        // "0" disables the feature entirely.
+        std::env::set_var("LUSTY_HISTORY", "0");
+        super::store_history("ignored");
+        assert!(!file.exists());
+        assert_eq!(super::load_history(), "");
+
+        std::env::remove_var("LUSTY_HISTORY");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

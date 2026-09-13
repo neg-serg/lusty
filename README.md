@@ -16,7 +16,9 @@ parallel walker, LS_COLORS coloring and metadata views.
 - Standalone TUI: grid or long view, eza-style columns
   (`--columns perm,user,size,time`, env `LUSTY_COLUMNS`),
   sorting (`--sort name|ext|size|time`, `--reverse`, `--dirs-first`),
-  icons (`LUSTY_ICONS=1`)
+  icons (`LUSTY_ICONS=1`), runtime search depth (`C-d`, 1..6) and a restored
+  last query (`$XDG_STATE_HOME/lusty/history`; `LUSTY_HISTORY` overrides the
+  file, `LUSTY_HISTORY=0` disables)
 - `serve` subcommand: headless backend for nvim floating windows — no
   terminal buffer involved, so it renders reliably even inside a web xterm
 - Neovim float client: `C-l` toggles the long view (metadata via the `M`
@@ -45,7 +47,8 @@ lusty [root] [--depth N] [--skip a,b] [--rows N] [--width N]
 
 Enter/Tab opens, C-t/C-o/C-v open in tabs/splits, C-n/C-p move, C-u clears,
 Esc/C-c/C-g cancels, C-l toggles the long view, C-y cycles the sort order
-(name/ext/size/time; `--sort` picks the starting order).
+(name/ext/size/time; `--sort` picks the starting order), C-d cycles the search
+depth (1..6). The last typed query is restored on the next run.
 
 ## serve protocol
 
