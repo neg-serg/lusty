@@ -101,22 +101,30 @@ fn unescape_bytes(s: &str) -> Vec<u8> {
     out
 }
 
-/// Preview text for an nvim buffer: drop ANSI escape sequences (chafa art is
-/// colour-only — the shapes survive), turn TAB into a space and drop other
-/// control bytes (`nvim_buf_set_lines` rejects raw LF and renders the rest as
-/// garbage), then clip to `width` characters.
-fn plain_line(s: &str, width: usize) -> String {
+/// Preview text for an nvim buffer. SGR sequences are kept so the client can
+/// turn chafa's colours into extmarks; other ANSI escapes are dropped, TAB
+/// becomes a space and other control bytes are removed (`nvim_buf_set_lines`
+/// rejects raw LF and renders the rest as garbage). Clipping counts visible
+/// characters only, so a kept SGR sequence never eats the row.
+fn preview_line(s: &str, width: usize) -> String {
     let mut out = String::with_capacity(s.len().min(width * 4));
     let mut chars = s.chars().peekable();
     let mut vis = 0usize;
     while let Some(c) = chars.next() {
         if c == '\x1b' {
             if chars.peek() == Some(&'[') {
+                let mut seq = String::from("\x1b[");
                 chars.next();
+                let mut last = None;
                 for n in chars.by_ref() {
+                    seq.push(n);
                     if ('\x40'..='\x7e').contains(&n) {
+                        last = Some(n);
                         break;
                     }
+                }
+                if last == Some('m') {
+                    out.push_str(&seq);
                 }
             } else {
                 let _ = chars.next();
@@ -124,7 +132,7 @@ fn plain_line(s: &str, width: usize) -> String {
             continue;
         }
         if vis >= width {
-            continue;
+            break;
         }
         if c == '\t' {
             out.push(' ');
@@ -355,7 +363,7 @@ pub fn serve(
                     .lines
                     .iter()
                     .take(h)
-                    .map(|l| plain_line(l, w))
+                    .map(|l| preview_line(l, w))
                     .collect();
                 writeln!(out, "V {} {}", lines.len(), u8::from(pane.dim))?;
                 for l in &lines {
@@ -370,4 +378,23 @@ pub fn serve(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::preview_line;
+
+    #[test]
+    fn preview_line_keeps_sgr_and_clips_visible_chars() {
+        // SGR survives so the client can build extmarks from it.
+        assert_eq!(
+            preview_line("\x1b[38;5;9mAB\x1b[0mCD", 40),
+            "\x1b[38;5;9mAB\x1b[0mCD"
+        );
+        // Clipping counts visible characters, not escape bytes, and keeps the
+        // escapes that precede the cut.
+        assert_eq!(preview_line("\x1b[38;5;9mABCD\x1b[0m", 2), "\x1b[38;5;9mAB");
+        // Non-SGR CSI (cursor movement) is dropped; TAB becomes a space.
+        assert_eq!(preview_line("a\x1b[2K\tb", 40), "a b");
+    }
 }
