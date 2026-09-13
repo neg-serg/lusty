@@ -201,18 +201,6 @@ pub fn serve(
                 writeln!(out, "E")?;
                 out.flush()?;
             }
-            "P" => {
-                let i: usize = parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(0);
-                if i < entries.len() {
-                    out.write_all(b"P ")?;
-                    write_escaped(&mut out, entries[i].path(&root).as_os_str().as_bytes())?;
-                    out.write_all(b"\n")?;
-                } else {
-                    writeln!(out, "P ")?;
-                }
-                writeln!(out, "E")?;
-                out.flush()?;
-            }
             "M" => {
                 // Metadata for the visible rows only: mask first, then entry
                 // indices (the R rows' <i> field). One stat per index, no

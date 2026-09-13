@@ -41,8 +41,8 @@ lusty [root] [--depth N] [--skip a,b] [--rows N] [--width N]
 ```
 
 Enter/Tab opens, C-t/C-o/C-v open in tabs/splits, C-n/C-p move, C-u clears,
-Esc/C-c/C-g cancels, C-l toggles the long view. The sort order is set by
-`--sort` at startup (the nvim float cycles it with C-y).
+Esc/C-c/C-g cancels, C-l toggles the long view, C-y cycles the sort order
+(name/ext/size/time; `--sort` picks the starting order).
 
 ## serve protocol
 
@@ -53,7 +53,6 @@ C <total> <depth> <root>          ready banner
 Q <from> <to> <query> [sort]      -> N <matched>, W <maxw>, R rows, E
 M <mask> <index>...               -> K <index> <meta> per index, E
 D                                 -> top-level dirs (for '/' completion), E
-P <index>                         -> P <absolute path>
 ```
 
 `sort`: 0 name, 1 ext, 2 size (desc), 3 time (desc). `meta` mask bits:

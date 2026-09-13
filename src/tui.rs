@@ -735,6 +735,16 @@ impl App {
                             }
                         }
                         (KeyCode::Char('l'), true) => self.long = !self.long,
+                        // C-y cycles the sort order like the nvim float: drop
+                        // the cached listing so the next draw re-sorts it.
+                        (KeyCode::Char('y'), true) => {
+                            self.sort_mode = (self.sort_mode + 1) % 4;
+                            self.hidden = None;
+                            self.dots = None;
+                            self.needs_rank = true;
+                            self.selected = 0;
+                            self.offset = 0;
+                        }
                         (KeyCode::Char('u'), true) => {
                             if !self.query.is_empty() {
                                 self.query.clear();
