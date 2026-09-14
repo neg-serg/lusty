@@ -16,9 +16,11 @@ parallel walker, LS_COLORS coloring and metadata views.
 - Standalone TUI: grid or long view, eza-style columns
   (`--columns perm,user,size,time`, env `LUSTY_COLUMNS`),
   sorting (`--sort name|ext|size|time`, `--reverse`, `--dirs-first`),
-  icons (`LUSTY_ICONS=1`), runtime search depth (`C-d`, 1..6) and a restored
-  last query (`$XDG_STATE_HOME/lusty/history`; `LUSTY_HISTORY` overrides the
-  file, `LUSTY_HISTORY=0` disables)
+  icons (`LUSTY_ICONS=1`), runtime search depth (`C-d`, 1..6), a restored last
+  query (`$XDG_STATE_HOME/lusty/history`; `LUSTY_HISTORY` overrides the file,
+  `LUSTY_HISTORY=0` disables) and an asynchronous right-hand preview pane
+  (chafa / git diff / man) that places images with the kitty graphics protocol
+  when the terminal supports it (`LUSTY_KITTY=0` disables, ANSI art otherwise)
 - `serve` subcommand: headless backend for nvim floating windows — no
   terminal buffer involved, so it renders reliably even inside a web xterm
 - Neovim float client: `C-l` toggles the long view (metadata via the `M`
@@ -100,6 +102,8 @@ cycling), `tests/serve_escape.rs` covers the escaping and non-UTF8 path
 round-trip, `tests/serve_frec.rs` the frecency-ordered empty query and
 `tests/serve_preview.rs` the `V` framing and clipping. CI (GitHub Actions) runs
 `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings` and `cargo test`.
+`--ru-map` / `--icon-map` dump the RU key and icon tables for the nvim parity
+smoke (`files/nvim/lua/lusty/tests/tables_parity_smoke.lua`).
 
 ## Benchmarks
 

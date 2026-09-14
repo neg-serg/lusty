@@ -23,6 +23,27 @@ use listing::FileKind;
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    // Debug dumps for the nvim parity smoke: the Lua tables in lusty/ru2en.lua
+    // and lusty/icons.lua must match these.
+    if args.first().map(|s| s.as_str()) == Some("--ru-map") {
+        for code in 0x400u32..=0x4ff {
+            if let Some(c) = char::from_u32(code) {
+                if let Some(en) = tui::ru_to_en(c) {
+                    println!("{c}\t{en}");
+                }
+            }
+        }
+        return;
+    }
+    if args.first().map(|s| s.as_str()) == Some("--icon-map") {
+        println!("dir\t{}", tui::ICON_DIR);
+        println!("link\t{}", tui::ICON_LINK);
+        println!("file\t{}", tui::ICON_FILE);
+        for (suffix, glyph) in tui::ICON_EXTS {
+            println!("ext\t{suffix}\t{glyph}");
+        }
+        return;
+    }
     if args.iter().any(|a| a == "-h" || a == "--help") {
         println!(
             "usage: lusty [root] [--depth N] [--skip a,b] [--rows N] [--width N]
@@ -32,6 +53,9 @@ fn main() {
   --skip a,b  directories skipped (default pic,tmp)
   --rows N  popup total height incl borders (default 14)
   --width N popup total width incl borders (default: full terminal width)
+
+  --ru-map    print the RU->EN key table (parity smoke)
+  --icon-map  print the icon table (parity smoke)
 
 Size may also come from LUSTY_ROWS / LUSTY_WIDTH env vars;
 command-line flags win.

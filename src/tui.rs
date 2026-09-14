@@ -79,6 +79,21 @@ pub fn normalize_query_char(c: char) -> Option<char> {
     }
 }
 
+/// Kitty graphics protocol support: `LUSTY_KITTY` overrides (`0` disables),
+/// otherwise auto-detected from the environment (kitty sets `KITTY_WINDOW_ID`
+/// and a `*kitty*` TERM). Without it the pane keeps the ANSI-art fallback.
+fn kitty_enabled() -> bool {
+    match std::env::var("LUSTY_KITTY") {
+        Ok(v) => v == "1" || v.eq_ignore_ascii_case("true"),
+        Err(_) => {
+            std::env::var_os("KITTY_WINDOW_ID").is_some()
+                || std::env::var("TERM")
+                    .map(|t| t.contains("kitty"))
+                    .unwrap_or(false)
+        }
+    }
+}
+
 /// Where the standalone picker remembers the last typed query. `LUSTY_HISTORY`
 /// overrides the path; `LUSTY_HISTORY=0` (or `off`) disables the feature.
 fn history_file() -> Option<PathBuf> {
@@ -152,6 +167,11 @@ pub struct App {
     pane_kind: u8,            // 0 off, 1 dim text (git/man/info), 2 chafa art
     pane: Vec<String>,        // pre-clipped pane rows (preview_w wide)
     pane_key: Option<String>, // cache key: path + size + geometry
+    pane_rx: Option<std::sync::mpsc::Receiver<(String, crate::preview::Pane, Option<String>)>>, // in-flight render
+    pane_kitty: Option<String>, // kitty graphics sequence for an image pane
+    kitty: bool,                // terminal speaks the kitty graphics protocol
+    kitty_drawn: bool,          // an image is currently placed
+    kitty_key: Option<String>,  // pane key the placed image belongs to
 }
 
 impl App {
@@ -189,6 +209,11 @@ impl App {
             pane_kind: 0,
             pane: Vec::new(),
             pane_key: None,
+            pane_rx: None,
+            pane_kitty: None,
+            kitty: kitty_enabled(),
+            kitty_drawn: false,
+            kitty_key: None,
         }
     }
 
@@ -655,17 +680,14 @@ impl App {
         (text_w / cols).max(6)
     }
 
-    /// (Re)render the right preview pane for the current selection. Cheap:
-    /// a cache key (path, size, geometry) is compared first and external
-    /// commands only spawn when the selection actually changed.
+    /// Start a preview render for the current selection when the key (path,
+    /// size, geometry) changed. `preview::render` may spawn chafa/git/man, so
+    /// it runs on a worker thread; `poll_pane` picks the result up from the
+    /// event loop, which keeps the UI responsive while a big image or repo
+    /// diff is being rendered.
     fn refresh_pane(&mut self) {
-        let clear = |app: &mut Self| {
-            app.pane.clear();
-            app.pane_kind = 0;
-            app.pane_key = None;
-        };
         if !self.preview_on || self.ranked.is_empty() || self.selected >= self.ranked.len() {
-            clear(self);
+            self.clear_pane();
             return;
         }
         let i = self.ranked[self.selected];
@@ -684,10 +706,70 @@ impl App {
                 .unwrap_or_else(|| "?".to_string())
         );
         if self.pane_key.as_deref() == Some(key.as_str()) {
-            return;
+            return; // already rendered, or the same render is in flight
         }
         let is_dir = e.kind == FileKind::Dir;
-        let pane = crate::preview::render(&path, is_dir, pw, rows);
+        let use_kitty = self.kitty;
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker_key = key.clone();
+        std::thread::spawn(move || {
+            let pane = crate::preview::render(&path, is_dir, pw, rows);
+            let kitty = if use_kitty && crate::preview::is_image(&path) {
+                crate::preview::kitty_image(&path, pw, rows)
+            } else {
+                None
+            };
+            let _ = tx.send((worker_key, pane, kitty));
+        });
+        self.pane_rx = Some(rx);
+        self.pane_key = Some(key);
+    }
+
+    fn clear_pane(&mut self) {
+        self.pane.clear();
+        self.pane_kind = 0;
+        self.pane_key = None;
+        self.pane_rx = None;
+        self.pane_kitty = None;
+    }
+
+    /// Install a finished preview when it still matches the current key;
+    /// returns true when the pane changed and the caller should redraw.
+    fn poll_pane(&mut self) -> bool {
+        let Some(rx) = self.pane_rx.take() else {
+            return false;
+        };
+        match rx.try_recv() {
+            Ok((key, pane, kitty)) => {
+                if !self.preview_on || self.pane_key.as_deref() != Some(key.as_str()) {
+                    return false; // stale: the selection moved on or preview closed
+                }
+                self.install_pane(&pane, kitty);
+                true
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                self.pane_rx = Some(rx); // still rendering
+                false
+            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => false,
+        }
+    }
+
+    /// Format and clip a rendered pane into the row buffer. With a kitty
+    /// graphics sequence the pane is blanked instead: the image (drawn above
+    /// the cell background, below text) shows through.
+    fn install_pane(&mut self, pane: &crate::preview::Pane, kitty: Option<String>) {
+        let rows = self.list_rows();
+        let pw = self.preview_w;
+        self.pane_kitty = kitty;
+        if self.pane_kitty.is_some() {
+            // Force a (re)placement: the key may already equal pane_key from a
+            // request that was in flight while the old image was still drawn.
+            self.kitty_key = None;
+            self.pane = vec![" ".repeat(pw); rows];
+            self.pane_kind = 2;
+            return;
+        }
         let dim_code = format!("{}[38;2;140;150;165m", char::from_u32(0x1b).unwrap());
         let mut out: Vec<String> = Vec::with_capacity(rows);
         for src in pane.lines.iter().take(rows) {
@@ -704,7 +786,6 @@ impl App {
         }
         self.pane = out;
         self.pane_kind = if pane.dim { 1 } else { 2 };
-        self.pane_key = Some(key);
     }
 
     /// Widest label (in chars) over the full listing of the current root,
@@ -735,151 +816,161 @@ impl App {
     fn loop_events(&mut self, out: &mut io::Stdout) -> io::Result<i32> {
         loop {
             self.draw(out)?;
-            let ev = event::read()?;
-            match ev {
-                Event::Key(KeyEvent {
-                    code, modifiers, ..
-                }) => {
-                    let ctrl = modifiers.contains(KeyModifiers::CONTROL);
-                    match (code, ctrl) {
-                        (KeyCode::Esc, _) => return Ok(1),
-                        (KeyCode::Char('c' | 'g'), true) => return Ok(1),
-                        (KeyCode::Enter | KeyCode::Tab, _) => self.open("edit")?,
-                        (KeyCode::Char('t'), true) => self.open("tabedit")?,
-                        (KeyCode::Char('o'), true) => self.open("split")?,
-                        (KeyCode::Char('v'), true) => self.open("vsplit")?,
-                        (KeyCode::Char('n'), true)
-                        | (KeyCode::Char('j'), true)
-                        | (KeyCode::Down, _) => {
-                            self.move_sel(1);
-                        }
-                        (KeyCode::Char('p'), true)
-                        | (KeyCode::Char('k'), true)
-                        | (KeyCode::Up, _) => {
-                            self.move_sel(-1);
-                        }
-                        (KeyCode::Char('f'), true) | (KeyCode::Right, _) => {
-                            let rows = self.list_rows();
-                            self.column_nav(1, rows);
-                        }
-                        (KeyCode::Char('b'), true) | (KeyCode::Left, _) => {
-                            let rows = self.list_rows();
-                            self.column_nav(-1, rows);
-                        }
-                        (KeyCode::Char('w'), true) => {
-                            // First C-w clears the typed query (shell/vim
-                            // word-delete feel); only a second C-w with an
-                            // empty query moves up a directory.
-                            if !self.query.is_empty() {
-                                self.query.clear();
+            // Wait for a key or a finished preview render; the short poll lets
+            // an async pane result land without a keypress.
+            loop {
+                if self.poll_pane() {
+                    break;
+                }
+                if !event::poll(std::time::Duration::from_millis(50))? {
+                    continue;
+                }
+                let ev = event::read()?;
+                match ev {
+                    Event::Key(KeyEvent {
+                        code, modifiers, ..
+                    }) => {
+                        let ctrl = modifiers.contains(KeyModifiers::CONTROL);
+                        match (code, ctrl) {
+                            (KeyCode::Esc, _) => return Ok(1),
+                            (KeyCode::Char('c' | 'g'), true) => return Ok(1),
+                            (KeyCode::Enter | KeyCode::Tab, _) => self.open("edit")?,
+                            (KeyCode::Char('t'), true) => self.open("tabedit")?,
+                            (KeyCode::Char('o'), true) => self.open("split")?,
+                            (KeyCode::Char('v'), true) => self.open("vsplit")?,
+                            (KeyCode::Char('n'), true)
+                            | (KeyCode::Char('j'), true)
+                            | (KeyCode::Down, _) => {
+                                self.move_sel(1);
+                            }
+                            (KeyCode::Char('p'), true)
+                            | (KeyCode::Char('k'), true)
+                            | (KeyCode::Up, _) => {
+                                self.move_sel(-1);
+                            }
+                            (KeyCode::Char('f'), true) | (KeyCode::Right, _) => {
+                                let rows = self.list_rows();
+                                self.column_nav(1, rows);
+                            }
+                            (KeyCode::Char('b'), true) | (KeyCode::Left, _) => {
+                                let rows = self.list_rows();
+                                self.column_nav(-1, rows);
+                            }
+                            (KeyCode::Char('w'), true) => {
+                                // First C-w clears the typed query (shell/vim
+                                // word-delete feel); only a second C-w with an
+                                // empty query moves up a directory.
+                                if !self.query.is_empty() {
+                                    self.query.clear();
+                                    self.needs_rank = true;
+                                    self.selected = 0;
+                                    self.offset = 0;
+                                } else if let Some(parent) = self.root.parent() {
+                                    if parent != self.root {
+                                        self.re_root(parent.to_path_buf());
+                                    }
+                                }
+                            }
+                            (KeyCode::Char('l'), true) => self.long = !self.long,
+                            // C-y cycles the sort order like the nvim float: drop
+                            // the cached listing so the next draw re-sorts it.
+                            (KeyCode::Char('y'), true) => {
+                                self.sort_mode = (self.sort_mode + 1) % 4;
+                                self.hidden = None;
+                                self.dots = None;
                                 self.needs_rank = true;
                                 self.selected = 0;
                                 self.offset = 0;
-                            } else if let Some(parent) = self.root.parent() {
-                                if parent != self.root {
-                                    self.re_root(parent.to_path_buf());
+                            }
+                            (KeyCode::Char('u'), true) => {
+                                if !self.query.is_empty() {
+                                    self.query.clear();
+                                    self.needs_rank = true;
+                                    self.selected = 0;
                                 }
                             }
-                        }
-                        (KeyCode::Char('l'), true) => self.long = !self.long,
-                        // C-y cycles the sort order like the nvim float: drop
-                        // the cached listing so the next draw re-sorts it.
-                        (KeyCode::Char('y'), true) => {
-                            self.sort_mode = (self.sort_mode + 1) % 4;
-                            self.hidden = None;
-                            self.dots = None;
-                            self.needs_rank = true;
-                            self.selected = 0;
-                            self.offset = 0;
-                        }
-                        (KeyCode::Char('u'), true) => {
-                            if !self.query.is_empty() {
-                                self.query.clear();
+                            // C-d cycles the search depth (1..6) like the nvim
+                            // float; the listing cache is keyed by depth, so the
+                            // next draw re-lists (or hits that depth's cache).
+                            (KeyCode::Char('d'), true) => {
+                                self.opts.depth = self.opts.depth % 6 + 1;
+                                self.hidden = None;
+                                self.dots = None;
                                 self.needs_rank = true;
                                 self.selected = 0;
+                                self.offset = 0;
                             }
-                        }
-                        // C-d cycles the search depth (1..6) like the nvim
-                        // float; the listing cache is keyed by depth, so the
-                        // next draw re-lists (or hits that depth's cache).
-                        (KeyCode::Char('d'), true) => {
-                            self.opts.depth = self.opts.depth % 6 + 1;
-                            self.hidden = None;
-                            self.dots = None;
-                            self.needs_rank = true;
-                            self.selected = 0;
-                            self.offset = 0;
-                        }
-                        // readline-ish: C-h = backspace, Home/End = first/last,
-                        // PgUp/PgDn = one page of the grid
-                        (KeyCode::Char('h'), true) => {
-                            if self.query.pop().is_some() {
-                                self.needs_rank = true;
-                                self.selected = 0;
+                            // readline-ish: C-h = backspace, Home/End = first/last,
+                            // PgUp/PgDn = one page of the grid
+                            (KeyCode::Char('h'), true) => {
+                                if self.query.pop().is_some() {
+                                    self.needs_rank = true;
+                                    self.selected = 0;
+                                }
                             }
-                        }
-                        (KeyCode::Home, _) | (KeyCode::Char('a'), true) => {
-                            if self.ranked_len() > 0 {
-                                self.selected = 0;
+                            (KeyCode::Home, _) | (KeyCode::Char('a'), true) => {
+                                if self.ranked_len() > 0 {
+                                    self.selected = 0;
+                                }
                             }
-                        }
-                        (KeyCode::End, _) | (KeyCode::Char('e'), true) => {
-                            let n = self.ranked_len();
-                            if n > 0 {
-                                self.selected = n - 1;
+                            (KeyCode::End, _) | (KeyCode::Char('e'), true) => {
+                                let n = self.ranked_len();
+                                if n > 0 {
+                                    self.selected = n - 1;
+                                }
                             }
-                        }
-                        (KeyCode::PageUp, _) => {
-                            let n = self.ranked_len();
-                            let page = self.list_rows();
-                            if n > 0 {
-                                self.selected = self.selected.saturating_sub(page);
+                            (KeyCode::PageUp, _) => {
+                                let n = self.ranked_len();
+                                let page = self.list_rows();
+                                if n > 0 {
+                                    self.selected = self.selected.saturating_sub(page);
+                                }
                             }
-                        }
-                        (KeyCode::PageDown, _) => {
-                            let n = self.ranked_len();
-                            let page = self.list_rows();
-                            if n > 0 {
-                                self.selected = (self.selected + page).min(n - 1);
+                            (KeyCode::PageDown, _) => {
+                                let n = self.ranked_len();
+                                let page = self.list_rows();
+                                if n > 0 {
+                                    self.selected = (self.selected + page).min(n - 1);
+                                }
                             }
-                        }
-                        (KeyCode::Backspace, _) => {
-                            if self.query.pop().is_some() {
-                                self.needs_rank = true;
-                                self.selected = 0;
+                            (KeyCode::Backspace, _) => {
+                                if self.query.pop().is_some() {
+                                    self.needs_rank = true;
+                                    self.selected = 0;
+                                }
                             }
-                        }
-                        (KeyCode::Char('/'), false) => self.slash_enter(),
-                        // Right preview pane: C-Space (NUL) or Shift+P toggles.
-                        (KeyCode::Char(' '), true) | (KeyCode::Char('P'), false) => {
-                            self.preview_on = !self.preview_on;
-                            self.pane_key = None;
-                            self.pane.clear();
-                        }
-                        (KeyCode::Char(c), false) => {
-                            if let Some(c) = normalize_query_char(c) {
-                                self.query.push(c);
-                                self.needs_rank = true;
-                                self.selected = 0;
+                            (KeyCode::Char('/'), false) => self.slash_enter(),
+                            // Right preview pane: C-Space (NUL) or Shift+P toggles.
+                            (KeyCode::Char(' '), true) | (KeyCode::Char('P'), false) => {
+                                self.preview_on = !self.preview_on;
+                                self.clear_pane();
                             }
+                            (KeyCode::Char(c), false) => {
+                                if let Some(c) = normalize_query_char(c) {
+                                    self.query.push(c);
+                                    self.needs_rank = true;
+                                    self.selected = 0;
+                                }
+                            }
+                            _ => {}
                         }
-                        _ => {}
                     }
-                }
-                Event::Resize(c, r) => {
-                    // Keep the box inside the new grid: recompute dimensions
-                    // from the fresh size and pull the box up if it no
-                    // longer fits below its current top row.
-                    self.size = (c as usize, r as usize);
-                    self.compute_box();
-                    let h = self.size.1;
-                    if self.pop_top + self.box_h > h {
-                        self.pop_top = h.saturating_sub(self.box_h);
+                    Event::Resize(c, r) => {
+                        // Keep the box inside the new grid: recompute dimensions
+                        // from the fresh size and pull the box up if it no
+                        // longer fits below its current top row.
+                        self.size = (c as usize, r as usize);
+                        self.compute_box();
+                        let h = self.size.1;
+                        if self.pop_top + self.box_h > h {
+                            self.pop_top = h.saturating_sub(self.box_h);
+                        }
                     }
+                    _ => {}
                 }
-                _ => {}
+                self.clamp_offset(self.list_rows());
+                break;
             }
-            self.clamp_offset(self.list_rows());
         }
     }
 
@@ -1009,6 +1100,26 @@ impl App {
         }
         frame.push('\u{2518}'); // \u2518
         frame.push_str(&format!("{esc}[0m{esc}[K"));
+        // Kitty image placement: emitted once per image (the escape sequence is
+        // large, so redraws must not resend it). A stale image is deleted when
+        // the selection moves to a non-image or the preview closes.
+        let emit =
+            self.pane_kitty.is_some() && self.kitty_key.as_deref() != self.pane_key.as_deref();
+        if emit {
+            if self.kitty_drawn {
+                frame.push_str("\x1b_Ga=d\x1b\\");
+            }
+            frame.push_str(&format!("{esc}[{};{}H", top + 2, lw + 3));
+            if let Some(seq) = &self.pane_kitty {
+                frame.push_str(seq);
+            }
+            self.kitty_key = self.pane_key.clone();
+            self.kitty_drawn = true;
+        } else if self.pane_kitty.is_none() && self.kitty_drawn {
+            frame.push_str("\x1b_Ga=d\x1b\\");
+            self.kitty_drawn = false;
+            self.kitty_key = None;
+        }
         write!(out, "{frame}")?;
         out.flush()
     }
@@ -1024,6 +1135,10 @@ impl App {
             s.push_str(&format!("[{};1H", top + r + 1));
             s.push(esc);
             s.push_str("[K");
+        }
+        if self.kitty_drawn {
+            // Do not leave a placed image behind after the picker exits.
+            s.push_str("\x1b_Ga=d\x1b\\");
         }
         write!(out, "{s}")?;
         out.flush()
@@ -1207,42 +1322,48 @@ fn query_match(label: &str, query: &str) -> Option<(usize, usize)> {
     }
 }
 
-const ICON_DIR: &str = "\u{f115}";
-const ICON_FILE: &str = "\u{f15b}";
+pub const ICON_DIR: &str = "\u{f115}";
+pub const ICON_FILE: &str = "\u{f15b}";
+pub const ICON_LINK: &str = "\u{f481}";
+
+/// Extension icons, checked in order (first suffix match wins). Must stay in
+/// sync with `lusty/icons.lua`; `--icon-map` prints this table for the nvim
+/// parity smoke.
+pub const ICON_EXTS: &[(&str, &str)] = &[
+    (".md", "\u{f48a}"),
+    (".rs", "\u{e7a8}"),
+    (".lua", "\u{e620}"),
+    (".scd", "\u{e620}"),
+    (".sc", "\u{e620}"),
+    (".jpg", "\u{f1c5}"),
+    (".jpeg", "\u{f1c5}"),
+    (".png", "\u{f1c5}"),
+    (".webp", "\u{f1c5}"),
+    (".gif", "\u{f1c5}"),
+    (".mp3", "\u{f001}"),
+    (".flac", "\u{f001}"),
+    (".wav", "\u{f001}"),
+    (".mp4", "\u{f03d}"),
+    (".mkv", "\u{f03d}"),
+    (".webm", "\u{f03d}"),
+    (".zip", "\u{f410}"),
+    (".tar", "\u{f410}"),
+    (".gz", "\u{f410}"),
+    (".7z", "\u{f410}"),
+];
 
 /// Nerd-font glyph for an entry; falls back to the generic file icon.
 fn icon_for(e: &crate::listing::Entry) -> &'static str {
     match e.kind {
         crate::listing::FileKind::Dir => ICON_DIR,
-        crate::listing::FileKind::Link => "\u{f481}",
+        crate::listing::FileKind::Link => ICON_LINK,
         _ => {
             let low = e.basename().to_ascii_lowercase();
-            if low.ends_with(".md") {
-                "\u{f48a}"
-            } else if low.ends_with(".rs") {
-                "\u{e7a8}"
-            } else if low.ends_with(".lua") || low.ends_with(".scd") || low.ends_with(".sc") {
-                "\u{e620}"
-            } else if low.ends_with(".jpg")
-                || low.ends_with(".jpeg")
-                || low.ends_with(".png")
-                || low.ends_with(".webp")
-                || low.ends_with(".gif")
-            {
-                "\u{f1c5}"
-            } else if low.ends_with(".mp3") || low.ends_with(".flac") || low.ends_with(".wav") {
-                "\u{f001}"
-            } else if low.ends_with(".mp4") || low.ends_with(".mkv") || low.ends_with(".webm") {
-                "\u{f03d}"
-            } else if low.ends_with(".zip")
-                || low.ends_with(".tar")
-                || low.ends_with(".gz")
-                || low.ends_with(".7z")
-            {
-                "\u{f410}"
-            } else {
-                ICON_FILE
-            }
+            ICON_EXTS
+                .iter()
+                .find(|(suffix, _)| low.ends_with(*suffix))
+                .map(|(_, glyph)| *glyph)
+                .unwrap_or(ICON_FILE)
         }
     }
 }
@@ -1350,5 +1471,86 @@ mod history_test {
 
         std::env::remove_var("LUSTY_HISTORY");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod pane_test {
+    use super::*;
+
+    fn fixture(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("lusty_async_pane_{tag}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("note.txt"), b"hello async preview\n").unwrap();
+        dir
+    }
+
+    fn app_for(dir: &std::path::Path) -> App {
+        let opts = Options {
+            depth: 1,
+            skip_dirs: vec![],
+            follow_mounts: false,
+            show_dots: false,
+        };
+        let mut app = App::new(dir.to_path_buf(), opts);
+        // The query may come from the history file when other tests set it;
+        // the pane test only cares about the selected entry.
+        app.query.clear();
+        app.needs_rank = true;
+        app.preview_on = true;
+        app.set_ui(Some(14), Some(80));
+        app.compute_box();
+        app.ensure_ranked();
+        app
+    }
+
+    #[test]
+    fn async_preview_installs_a_pane() {
+        let dir = fixture("install");
+        let mut app = app_for(&dir);
+        assert!(!app.ranked.is_empty(), "fixture listed");
+        app.selected = 0;
+        app.refresh_pane();
+        assert!(app.pane_rx.is_some(), "render spawned on a worker thread");
+
+        let mut landed = false;
+        for _ in 0..300 {
+            if app.poll_pane() {
+                landed = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(landed, "preview result picked up");
+        assert!(
+            app.pane.iter().any(|l| l.contains("hello async preview")),
+            "pane shows the file content: {:?}",
+            app.pane
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn clear_pane_drops_the_pending_render() {
+        let dir = fixture("clear");
+        let mut app = app_for(&dir);
+        app.selected = 0;
+        app.refresh_pane();
+        app.clear_pane();
+        assert!(app.pane_rx.is_none(), "receiver dropped");
+        assert!(app.pane_key.is_none(), "key dropped");
+        assert!(!app.poll_pane(), "nothing to install");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn kitty_env_override() {
+        std::env::set_var("LUSTY_KITTY", "0");
+        assert!(!kitty_enabled(), "explicit off");
+        std::env::set_var("LUSTY_KITTY", "1");
+        assert!(kitty_enabled(), "explicit on");
+        std::env::remove_var("LUSTY_KITTY");
     }
 }

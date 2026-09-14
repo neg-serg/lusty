@@ -117,6 +117,42 @@ pub fn render(path: &Path, is_dir: bool, width: usize, height: usize) -> Pane {
     }
 }
 
+/// Kitty graphics escape sequence for an image (chafa `--format kitty`), with
+/// the cursor show/hide wrappers and the trailing newline stripped so the TUI
+/// keeps control of the cursor. Returns None for non-images, oversized files
+/// and when chafa is missing or fails — the caller then keeps the ANSI-art
+/// pane as a fallback.
+pub fn kitty_image(path: &Path, width: usize, height: usize) -> Option<String> {
+    if !is_image(path) {
+        return None;
+    }
+    let len = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+    if len > max_image_bytes() {
+        return None;
+    }
+    let size = format!("{}x{}", width.max(1), height.max(1));
+    let out = Command::new("chafa")
+        .args(["--format", "kitty", "--size"])
+        .arg(&size)
+        .arg(path)
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let raw = String::from_utf8_lossy(&out.stdout);
+    let seq = raw
+        .strip_prefix("\x1b[?25l")
+        .unwrap_or(&raw)
+        .trim_end_matches("\x1b[?25h")
+        .trim_end_matches('\n');
+    if seq.contains("\x1b_G") {
+        Some(seq.to_string())
+    } else {
+        None
+    }
+}
+
 /// Largest slice read for the content preview.
 const MAX_TEXT_BYTES: usize = 256 * 1024;
 
@@ -291,6 +327,43 @@ mod tests {
             "{:?}",
             pane.lines
         );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Minimal 2x2 RGB PNG, so the kitty test does not need an image library.
+    const TINY_PNG: &[u8] = &[
+        0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44,
+        0x52, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x02, 0x08, 0x02, 0x00, 0x00, 0x00, 0xfd,
+        0xd4, 0x9a, 0x73, 0x00, 0x00, 0x00, 0x11, 0x49, 0x44, 0x41, 0x54, 0x78, 0xda, 0x63, 0xf8,
+        0xcf, 0xc0, 0xc0, 0xf0, 0x1f, 0x8c, 0x80, 0x18, 0x00, 0x1d, 0xf0, 0x03, 0xfd, 0xae, 0x3f,
+        0xe2, 0x38, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
+    ];
+
+    #[test]
+    fn kitty_image_needs_chafa_and_an_image() {
+        let dir = std::env::temp_dir().join(format!("lusty_prev_kitty_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let text = dir.join("note.txt");
+        std::fs::write(&text, b"hello").unwrap();
+        assert!(
+            kitty_image(&text, 4, 2).is_none(),
+            "text files are not images"
+        );
+
+        let png = dir.join("tiny.png");
+        std::fs::write(&png, TINY_PNG).unwrap();
+        // chafa is not a build input, so the nix sandbox runs this as a no-op.
+        if Command::new("chafa").arg("--version").output().is_err() {
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        }
+        let seq = kitty_image(&png, 4, 2).expect("kitty sequence for a PNG");
+        assert!(seq.contains("\x1b_G"), "kitty escape: {seq:?}");
+        assert!(!seq.ends_with("\x1b[?25h"), "cursor wrapper stripped");
+        assert!(!seq.ends_with('\n'), "trailing newline stripped");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
