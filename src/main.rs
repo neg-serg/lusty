@@ -106,6 +106,7 @@ command-line flags win.
         let mut depth = 2usize;
         let mut skip = "pic,tmp".to_string();
         let mut show_dots = false;
+        let mut follow_mounts = false;
         let mut i = 1;
         while i < args.len() {
             match args[i].as_str() {
@@ -118,6 +119,7 @@ command-line flags win.
                     skip = args.get(i).cloned().unwrap_or_default();
                 }
                 "--dots" => show_dots = true,
+                "--follow-mounts" => follow_mounts = true,
                 other if !other.starts_with("--") => {
                     root = PathBuf::from(other);
                 }
@@ -133,6 +135,7 @@ command-line flags win.
                 .filter(|s| !s.is_empty())
                 .collect(),
             show_dots,
+            follow_mounts,
         );
         return;
     }

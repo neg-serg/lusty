@@ -152,11 +152,12 @@ pub fn serve(
     depth: usize,
     skip_dirs: Vec<String>,
     show_dots: bool,
+    follow_mounts: bool,
 ) -> io::Result<()> {
     let opts = Options {
         depth,
         skip_dirs,
-        follow_mounts: false,
+        follow_mounts,
         show_dots,
     };
     // Canonical listing; sorting (Q sort token) reorders it in place and
