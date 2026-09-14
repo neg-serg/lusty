@@ -252,6 +252,19 @@ impl App {
         self.long = on;
     }
 
+    /// Enable nerd-font icons (CLI flag; `LUSTY_ICONS=1` also enables them).
+    pub fn set_icons(&mut self, on: bool) {
+        self.icons = on;
+    }
+
+    /// Start with a query typed in the prompt (CLI `--query`).
+    pub fn set_query(&mut self, query: &str) {
+        self.query = query.to_string();
+        self.needs_rank = true;
+        self.selected = 0;
+        self.offset = 0;
+    }
+
     pub fn set_ui(&mut self, rows: Option<usize>, width: Option<usize>) {
         let env_usize = |name: &str| {
             std::env::var(name)
@@ -1004,12 +1017,19 @@ impl App {
                         }
                         if let Some((ms, me)) = query_match(&e.label, &self.query) {
                             cell.push_str(&e.label[..ms]);
-                            if theme().match_underline {
+                            let mt = theme();
+                            if let Some([r, g, b]) = mt.match_fg {
+                                cell.push_str(&format!("{esc}[38;2;{r};{g};{b}m"));
+                            }
+                            if mt.match_underline {
                                 cell.push_str(&format!("{esc}[4m"));
                             }
                             cell.push_str(&e.label[ms..me]);
-                            if theme().match_underline {
+                            if mt.match_underline {
                                 cell.push_str(&format!("{esc}[24m"));
+                            }
+                            if mt.match_fg.is_some() {
+                                cell.push_str(&format!("{esc}[39m"));
                             }
                             cell.push_str(&e.label[me..]);
                         } else {
@@ -1163,14 +1183,18 @@ impl App {
 /// Outer popup height: two border rows plus up to 12 content rows.
 const OUTER_ROWS: usize = 14;
 
-/// Selection theme loaded from the Lusty TOML (env LUSTY_THEME, default
-/// ~/.config/lusty/theme.toml). The file uses the same simple key=value
-/// lines the nvim side reads, so both interfaces share one theme.
+/// Selection theme loaded from the Lusty TOML (env `LUSTY_THEME`; by default
+/// the nvim copy at `$XDG_CONFIG_HOME/nvim/lua/lusty/theme.toml`, then the
+/// standalone one at `$XDG_CONFIG_HOME/lusty/theme.toml`). The file uses the
+/// same simple key=value lines the nvim side reads, so both interfaces share
+/// one theme; `--theme-map` dumps the resolved values for the parity smoke.
 struct Theme {
     sel_bg: Option<[u8; 3]>,
     sel_fg: Option<[u8; 3]>,
     sel_bold: bool,
+    sel_underline: bool,
     sel_reverse: bool,
+    match_fg: Option<[u8; 3]>,
     match_underline: bool,
 }
 
@@ -1191,15 +1215,41 @@ fn theme_default() -> Theme {
         sel_bg: Some([0x00, 0x5f, 0xaf]),
         sel_fg: Some([0xd1, 0xe5, 0xff]),
         sel_bold: true,
+        sel_underline: false,
         sel_reverse: false,
+        match_fg: None,
         match_underline: true,
     }
 }
 
+/// Theme file resolution shared with the nvim side: `LUSTY_THEME` wins, then
+/// the deployed nvim copy, then the standalone one.
+fn theme_path() -> String {
+    if let Ok(p) = std::env::var("LUSTY_THEME") {
+        if !p.trim().is_empty() {
+            return p;
+        }
+    }
+    let base = std::env::var("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .ok()
+        .or_else(|| {
+            std::env::var("HOME")
+                .ok()
+                .map(|h| PathBuf::from(h).join(".config"))
+        });
+    if let Some(base) = base {
+        let nvim = base.join("nvim/lua/lusty/theme.toml");
+        if nvim.exists() {
+            return nvim.display().to_string();
+        }
+        return base.join("lusty/theme.toml").display().to_string();
+    }
+    String::new()
+}
+
 fn load_theme() -> Theme {
-    let path = std::env::var("LUSTY_THEME")
-        .or_else(|_| std::env::var("HOME").map(|h| format!("{h}/.config/lusty/theme.toml")))
-        .unwrap_or_default();
+    let path = theme_path();
     let mut t = theme_default();
     let Ok(content) = std::fs::read_to_string(path) else {
         return t;
@@ -1220,12 +1270,36 @@ fn load_theme() -> Theme {
             ("lusty.selection", "bg") => t.sel_bg = hex3(val),
             ("lusty.selection", "fg") => t.sel_fg = hex3(val),
             ("lusty.selection", "bold") => t.sel_bold = val == "true",
+            ("lusty.selection", "underline") => t.sel_underline = val == "true",
             ("lusty.selection", "reverse") => t.sel_reverse = val == "true",
+            ("lusty.match", "fg") => t.match_fg = hex3(val),
             ("lusty.match", "underline") => t.match_underline = val == "true",
             _ => {}
         }
     }
     t
+}
+
+/// Resolved theme as `key\tvalue` lines, used by `--theme-map` and the nvim
+/// parity smoke (values are `#rrggbb`, `true`/`false` or `none`).
+pub fn theme_dump() -> Vec<(String, String)> {
+    let t = load_theme();
+    let hex = |c: Option<[u8; 3]>| {
+        c.map(|[r, g, b]| format!("#{r:02x}{g:02x}{b:02x}"))
+            .unwrap_or_else(|| "none".to_string())
+    };
+    vec![
+        ("selection.bg".to_string(), hex(t.sel_bg)),
+        ("selection.fg".to_string(), hex(t.sel_fg)),
+        ("selection.bold".to_string(), t.sel_bold.to_string()),
+        (
+            "selection.underline".to_string(),
+            t.sel_underline.to_string(),
+        ),
+        ("selection.reverse".to_string(), t.sel_reverse.to_string()),
+        ("match.fg".to_string(), hex(t.match_fg)),
+        ("match.underline".to_string(), t.match_underline.to_string()),
+    ]
 }
 
 static THEME: std::sync::OnceLock<Theme> = std::sync::OnceLock::new();
@@ -1243,6 +1317,9 @@ fn sel_style() -> String {
     if theme().sel_reverse {
         s.push_str("7;");
     }
+    if theme().sel_underline {
+        s.push_str("4;");
+    }
     if let Some([r, g, b]) = theme().sel_bg {
         s.push_str(&format!("48;2;{};{};{};", r, g, b));
     }
@@ -1256,9 +1333,6 @@ fn sel_style() -> String {
     s
 }
 
-/// Byte range of the first plain case-insensitive occurrence of `query` in
-/// the basename of `label`, or None. Like the nvim float, a query starting
-/// with '.' (dot-toggle) is ignored; non-ASCII labels are skipped so the
 /// Byte range of the first plain case-insensitive occurrence of `query` in the
 /// basename of `label`, or None. Like the nvim float, a query starting with
 /// '.' (dot-toggle) is ignored. Matching is ASCII-case-insensitive on the raw

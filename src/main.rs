@@ -44,6 +44,36 @@ fn main() {
         }
         return;
     }
+    if args.first().map(|s| s.as_str()) == Some("--theme-map") {
+        // Resolved theme (honours LUSTY_THEME) for the nvim parity smoke.
+        for (key, value) in tui::theme_dump() {
+            println!("{key}\t{value}");
+        }
+        return;
+    }
+    if args.first().map(|s| s.as_str()) == Some("--color-map") {
+        // LS_COLORS resolution for the nvim parity smoke: every argument is
+        // "<kind>:<name>[:exec]" and the answer is the raw code (empty when no
+        // rule matches).
+        let palette = colors::load();
+        for spec in args.iter().skip(1) {
+            let mut parts = spec.splitn(3, ':');
+            let kind = match parts.next().unwrap_or("f") {
+                "d" => FileKind::Dir,
+                "l" => FileKind::Link,
+                "s" => FileKind::Socket,
+                "p" => FileKind::Pipe,
+                "b" => FileKind::Block,
+                "c" => FileKind::Char,
+                _ => FileKind::File,
+            };
+            let name = parts.next().unwrap_or("");
+            let exec = parts.next() == Some("exec");
+            let code = palette.code_for(name, kind, exec).unwrap_or("");
+            println!("{spec}\t{code}");
+        }
+        return;
+    }
     if args.iter().any(|a| a == "-h" || a == "--help") {
         println!(
             "usage: lusty [root] [--depth N] [--skip a,b] [--rows N] [--width N]
@@ -53,9 +83,13 @@ fn main() {
   --skip a,b  directories skipped (default pic,tmp)
   --rows N  popup total height incl borders (default 14)
   --width N popup total width incl borders (default: full terminal width)
+  --icons   nerd-font icons (also LUSTY_ICONS=1)
+  --query Q start with Q typed in the prompt
 
-  --ru-map    print the RU->EN key table (parity smoke)
-  --icon-map  print the icon table (parity smoke)
+  --ru-map     print the RU->EN key table (parity smoke)
+  --icon-map   print the icon table (parity smoke)
+  --theme-map  print the resolved theme (parity smoke)
+  --color-map  resolve LS_COLORS probes (parity smoke)
 
 Size may also come from LUSTY_ROWS / LUSTY_WIDTH env vars;
 command-line flags win.
@@ -114,12 +148,19 @@ command-line flags win.
     let mut dirs_first = false;
     let mut sort_mode = 0u8; // 0 name, 1 ext, 2 size, 3 time
     let mut columns: Option<String> = None;
+    let mut icons = false;
+    let mut query = String::new();
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
             "--long" => long = true,
             "--reverse" => reverse = true,
             "--dirs-first" => dirs_first = true,
+            "--icons" => icons = true,
+            "--query" => {
+                i += 1;
+                query = args.get(i).cloned().unwrap_or_default();
+            }
             "--sort" => {
                 i += 1;
                 sort_mode = match args.get(i).map(|s| s.as_str()) {
@@ -180,6 +221,12 @@ command-line flags win.
     app.set_long(long);
     app.set_sort(reverse, dirs_first);
     app.set_sort_mode(sort_mode);
+    if icons {
+        app.set_icons(true);
+    }
+    if !query.is_empty() {
+        app.set_query(&query);
+    }
     let cols_spec = columns.unwrap_or_else(|| std::env::var("LUSTY_COLUMNS").unwrap_or_default());
     if !cols_spec.is_empty() {
         app.set_columns(&cols_spec);
