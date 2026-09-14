@@ -18,9 +18,10 @@ parallel walker, LS_COLORS coloring and metadata views.
   sorting (`--sort name|ext|size|time`, `--reverse`, `--dirs-first`),
   icons (`LUSTY_ICONS=1`), runtime search depth (`C-d`, 1..6), a restored last
   query (`$XDG_STATE_HOME/lusty/history`; `LUSTY_HISTORY` overrides the file,
-  `LUSTY_HISTORY=0` disables) and an asynchronous right-hand preview pane
-  (chafa / git diff / man) that places images with the kitty graphics protocol
-  when the terminal supports it (`LUSTY_KITTY=0` disables, ANSI art otherwise)
+  `LUSTY_HISTORY=0` disables), a display-cell-aware grid (CJK/emoji names stay
+  aligned) and an asynchronous right-hand preview pane (chafa / git diff / man)
+  that places images with the kitty graphics protocol when the terminal supports
+  it (`LUSTY_KITTY=0` disables, ANSI art otherwise)
 - `serve` subcommand: headless backend for nvim floating windows — no
   terminal buffer involved, so it renders reliably even inside a web xterm
 - Neovim float client: `C-l` toggles the long view (metadata via the `M`

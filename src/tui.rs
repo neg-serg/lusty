@@ -294,7 +294,7 @@ impl App {
             // 150k-entry tree is pure waste.
             self.maxw = listed
                 .iter()
-                .map(|e| e.label.chars().count())
+                .map(|e| str_width(&e.label))
                 .max()
                 .unwrap_or(0);
             if dots {
@@ -459,15 +459,12 @@ impl App {
         terminal::enable_raw_mode()?;
         let mut stdout = io::stdout();
         execute!(stdout, cursor::Hide)?;
-        // Capture the prompt position first: the cursor sits on the
-        // empty line right below the command line the picker was
-        // launched from.
-        self.cursor_row = probe_cursor_row();
-        // The ioctl size can be stale when running inside a nvim
-        // terminal buffer; ask the terminal emulator directly (DSR
-        // cursor report after moving to a huge position) for the real
-        // grid size.
-        let probed = probe_size();
+        // Ask for the prompt row and the real grid size in one DSR round trip:
+        // the cursor sits on the empty line right below the command line the
+        // picker was launched from, and the ioctl size can be stale when
+        // running inside a nvim terminal buffer.
+        let (cursor_row, probed) = probe_terminal();
+        self.cursor_row = cursor_row;
         if let Some((cols, rows)) = probed {
             self.size = (cols, rows);
         } else {
@@ -478,7 +475,7 @@ impl App {
         self.compute_box();
         // Place the box directly under the command line; when it would
         // run past the bottom of the screen, scroll the content up first
-        // (fzf --height behaviour). probe_size parked the cursor on the
+        // (fzf --height behaviour). probe_terminal parked the cursor on the
         // bottom row, so plain newlines scroll.
         let esc = char::from_u32(0x1b).unwrap();
         let r0 = self
@@ -513,25 +510,27 @@ impl App {
     }
 }
 
-/// Ask the terminal for its real dimensions: move the cursor far away and
-/// request its position (DSR). Every emulator answers ESC[<row>;<col>R.
-fn probe_size() -> Option<(usize, usize)> {
+/// Ask the terminal where the cursor is and how big the grid is. Both DSR
+/// queries are written up front and their replies read in one pass, so a
+/// terminal that does not answer costs a single timeout instead of two.
+/// Returns (0-based cursor row, (cols, rows)).
+fn probe_terminal() -> (Option<usize>, Option<(usize, usize)>) {
     use std::time::{Duration, Instant};
 
     let esc = char::from_u32(0x1b).unwrap();
     let mut out = io::stdout();
-    write!(out, "{esc}[9999;9999H{esc}[6n").ok()?;
-    out.flush().ok()?;
+    // First reply: the real cursor position (the panel anchor). Moving to
+    // 9999;9999 clamps the second reply to the bottom-right corner = size.
+    if write!(out, "{esc}[6n{esc}[9999;9999H{esc}[6n").is_err() || out.flush().is_err() {
+        return (None, None);
+    }
 
-    let deadline = Instant::now() + Duration::from_millis(400);
+    let deadline = Instant::now() + Duration::from_millis(250);
     let mut buf = Vec::new();
     let mut byte = [0u8; 1];
-    loop {
-        if Instant::now() >= deadline {
-            return None;
-        }
+    while buf.len() < 48 && Instant::now() < deadline {
         let remaining = deadline.saturating_duration_since(Instant::now());
-        let ms = remaining.as_millis().min(100) as i32;
+        let ms = remaining.as_millis().min(60) as i32;
         let mut fds = [libc::pollfd {
             fd: 0,
             events: libc::POLLIN,
@@ -542,72 +541,29 @@ fn probe_size() -> Option<(usize, usize)> {
         if rc <= 0 {
             continue; // timeout or poll error
         }
-        // Read raw from fd 0; see probe_cursor_row for why not io::stdin.
+        // Read raw from fd 0 (not io::stdin, whose BufReader would swallow the
+        // rest of a reply and strand it outside the kernel queue).
         // SAFETY: byte is a valid 1-byte buffer for the stdin fd.
         let n = unsafe { libc::read(0, byte.as_mut_ptr().cast(), 1) };
         if n <= 0 {
-            return None;
+            break;
         }
         buf.push(byte[0]);
-        if byte[0] == b'R' {
+        if String::from_utf8_lossy(&buf).matches('R').count() >= 2 {
             break;
         }
     }
+
     let s = String::from_utf8_lossy(&buf);
-    let (row, col) = parse_dsr(&s)?;
-    Some((col, row))
+    let replies: Vec<(usize, usize)> = s.split('R').filter_map(parse_dsr).collect();
+    let cursor_row = replies.first().map(|(row, _)| row.saturating_sub(1));
+    let size = replies.get(1).map(|(row, col)| (*col, *row));
+    (cursor_row, size)
 }
 
-/// Parse ESC[<row>;<col>R.
-/// Ask the terminal where the cursor is (DSR), so the panel can start right
-/// below the command line. Returns the 0-based row.
-fn probe_cursor_row() -> Option<usize> {
-    use std::time::{Duration, Instant};
-
-    let esc = char::from_u32(0x1b).unwrap();
-    let mut out = io::stdout();
-    write!(out, "{esc}[6n").ok()?;
-    out.flush().ok()?;
-
-    let deadline = Instant::now() + Duration::from_millis(200);
-    let mut buf = Vec::new();
-    let mut byte = [0u8; 1];
-    loop {
-        if Instant::now() >= deadline {
-            return None;
-        }
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        let ms = remaining.as_millis().min(50) as i32;
-        let mut fds = [libc::pollfd {
-            fd: 0,
-            events: libc::POLLIN,
-            revents: 0,
-        }];
-        // SAFETY: valid pollfd array for the stdin fd.
-        let rc = unsafe { libc::poll(fds.as_mut_ptr(), 1, ms) };
-        if rc <= 0 {
-            continue;
-        }
-        // Read raw from fd 0 (not io::stdin, whose BufReader would swallow
-        // the rest of the DSR reply and strand it outside the kernel queue).
-        // SAFETY: byte is a valid 1-byte buffer for the stdin fd.
-        let n = unsafe { libc::read(0, byte.as_mut_ptr().cast(), 1) };
-        if n <= 0 {
-            return None;
-        }
-        buf.push(byte[0]);
-        if byte[0] == b'R' {
-            break;
-        }
-    }
-    let s = String::from_utf8_lossy(&buf);
-    let (row, _col) = parse_dsr(&s)?;
-    Some(row.saturating_sub(1))
-}
-
-fn parse_dsr(s: &str) -> Option<(usize, usize)> {
-    let inner = s.rsplit('[').next()?;
-    let inner = inner.strip_suffix('R')?;
+/// Parse the `<row>;<col>` tail of an `ESC[<row>;<col>R` reply.
+fn parse_dsr(part: &str) -> Option<(usize, usize)> {
+    let inner = part.rsplit('[').next()?;
     let mut parts = inner.split(';');
     let row: usize = parts.next()?.trim().parse().ok()?;
     let col: usize = parts.next()?.trim().parse().ok()?;
@@ -693,7 +649,14 @@ impl App {
         let i = self.ranked[self.selected];
         let e = self.listing()[i].clone();
         let path = e.path(&self.root);
-        let len = std::fs::metadata(&path).ok().map(|m| m.len());
+        // Size plus mtime: an edit that keeps the size (and even a same-second
+        // save) must invalidate the cached pane.
+        let stamp = std::fs::metadata(&path)
+            .map(|m| {
+                use std::os::unix::fs::MetadataExt;
+                format!("{}.{}.{}", m.size(), m.mtime(), m.mtime_nsec())
+            })
+            .unwrap_or_else(|_| "?".to_string());
         let rows = self.list_rows();
         let pw = self.preview_w;
         let key = format!(
@@ -702,8 +665,7 @@ impl App {
             pw,
             rows,
             e.kind == FileKind::Dir,
-            len.map(|l| l.to_string())
-                .unwrap_or_else(|| "?".to_string())
+            stamp
         );
         if self.pane_key.as_deref() == Some(key.as_str()) {
             return; // already rendered, or the same render is in flight
@@ -1297,29 +1259,27 @@ fn sel_style() -> String {
 /// Byte range of the first plain case-insensitive occurrence of `query` in
 /// the basename of `label`, or None. Like the nvim float, a query starting
 /// with '.' (dot-toggle) is ignored; non-ASCII labels are skipped so the
-/// byte offsets stay exact.
+/// Byte range of the first plain case-insensitive occurrence of `query` in the
+/// basename of `label`, or None. Like the nvim float, a query starting with
+/// '.' (dot-toggle) is ignored. Matching is ASCII-case-insensitive on the raw
+/// bytes: the query is ASCII (the input normalizer drops other scripts) and a
+/// match can only start on a char boundary, so non-ASCII labels are fine.
 fn query_match(label: &str, query: &str) -> Option<(usize, usize)> {
-    if query.is_empty() || query.starts_with('.') || !label.is_ascii() {
+    if query.is_empty() || query.starts_with('.') {
         return None;
     }
-    let base_len = label
-        .rfind('/')
-        .map(|i| label.len() - i - 1)
-        .unwrap_or(label.len());
-    let base_start = label.len() - base_len;
-    let base = &label[base_start..];
-    let q = query.to_lowercase();
-    if let Some(pos) = base.to_lowercase().find(&q) {
-        let start = base_start + pos;
-        let end = start + q.len();
-        if end <= label.len() {
-            Some((start, end))
-        } else {
-            None
-        }
-    } else {
-        None
+    let base_start = label.rfind('/').map(|i| i + 1).unwrap_or(0);
+    let hay = &label.as_bytes()[base_start..];
+    let needle = query.as_bytes();
+    if needle.is_empty() || needle.len() > hay.len() {
+        return None;
     }
+    for i in 0..=(hay.len() - needle.len()) {
+        if hay[i..i + needle.len()].eq_ignore_ascii_case(needle) {
+            return Some((base_start + i, base_start + i + needle.len()));
+        }
+    }
+    None
 }
 
 pub const ICON_DIR: &str = "\u{f115}";
@@ -1374,6 +1334,48 @@ fn is_exec(path: &std::path::Path) -> bool {
         .unwrap_or(false)
 }
 
+/// Display width of one character in terminal cells. A compact approximation
+/// covering what a picker meets: ASCII/Latin 1, CJK/kana/Hangul and emoji 2,
+/// combining marks and joiners 0. The nvim float uses `strdisplaywidth`; this
+/// keeps the standalone grid aligned for the same names.
+pub(crate) fn char_width(c: char) -> usize {
+    let u = c as u32;
+    // Zero-width: combining marks, joiners, variation selectors, skin tones.
+    if (0x0300..=0x036F).contains(&u)
+        || (0x1AB0..=0x1AFF).contains(&u)
+        || (0x1DC0..=0x1DFF).contains(&u)
+        || (0x20D0..=0x20FF).contains(&u)
+        || (0xFE00..=0xFE0F).contains(&u)
+        || (0xFE20..=0xFE2F).contains(&u)
+        || u == 0x200B
+        || u == 0x200C
+        || u == 0x200D
+        || (0x1F3FB..=0x1F3FF).contains(&u)
+    {
+        return 0;
+    }
+    // East Asian Wide/Fullwidth and emoji.
+    if (0x1100..=0x115F).contains(&u)
+        || (0x2E80..=0xA4CF).contains(&u)
+        || (0xAC00..=0xD7A3).contains(&u)
+        || (0xF900..=0xFAFF).contains(&u)
+        || (0xFE10..=0xFE19).contains(&u)
+        || (0xFE30..=0xFE6F).contains(&u)
+        || (0xFF00..=0xFF60).contains(&u)
+        || (0xFFE0..=0xFFE6).contains(&u)
+        || (0x1F300..=0x1FAFF).contains(&u)
+        || (0x20000..=0x3FFFD).contains(&u)
+    {
+        return 2;
+    }
+    1
+}
+
+/// Display width of a string in terminal cells.
+pub(crate) fn str_width(s: &str) -> usize {
+    s.chars().map(char_width).sum()
+}
+
 pub(crate) fn ansi_pad(line: &mut String, width: usize) {
     let src: Vec<char> = line.chars().collect();
     let mut out = String::with_capacity(src.len() + width);
@@ -1400,8 +1402,16 @@ pub(crate) fn ansi_pad(line: &mut String, width: usize) {
         if vis >= width {
             continue; // truncate visible content past the width
         }
+        let w = char_width(c);
+        if w == 0 {
+            out.push(c); // stays attached to the previous glyph
+            continue;
+        }
+        if vis + w > width {
+            continue; // a wide char that does not fit: padding fills the cell
+        }
         out.push(c);
-        vis += 1;
+        vis += w;
     }
     while vis < width {
         out.push(' ');
@@ -1552,5 +1562,51 @@ mod pane_test {
         std::env::set_var("LUSTY_KITTY", "1");
         assert!(kitty_enabled(), "explicit on");
         std::env::remove_var("LUSTY_KITTY");
+    }
+}
+
+#[cfg(test)]
+mod width_test {
+    use super::*;
+
+    #[test]
+    fn display_width_counts_cells() {
+        assert_eq!(str_width("abc"), 3);
+        assert_eq!(str_width("中"), 2);
+        assert_eq!(str_width("中文"), 4);
+        assert_eq!(str_width("e\u{301}"), 1, "combining acute is zero-width");
+        assert_eq!(str_width("🙂"), 2);
+        assert_eq!(char_width('\u{200d}'), 0, "zero-width joiner");
+    }
+
+    #[test]
+    fn ansi_pad_uses_cells() {
+        let mut s = String::from("中中");
+        ansi_pad(&mut s, 3); // 4 cells: the second wide char does not fit
+        assert_eq!(s, "中 ");
+        let mut s = String::from("中");
+        ansi_pad(&mut s, 4);
+        assert_eq!(s, "中  ");
+    }
+
+    #[test]
+    fn query_match_handles_non_ascii() {
+        let label = "суб/файл.txt";
+        let (s, e) = query_match(label, "файл").expect("match in a non-ASCII label");
+        assert_eq!(&label[s..e], "файл");
+
+        let ascii = "café.txt";
+        let (s, e) = query_match(ascii, "CAF").expect("ASCII case-insensitive");
+        assert_eq!(&ascii[s..e], "caf");
+
+        assert!(query_match("a/.hidden", ".").is_none(), "dot query ignored");
+        assert!(query_match("abc", "zzz").is_none());
+    }
+
+    #[test]
+    fn dsr_replies_parse() {
+        let s = "\x1b[7;3R\x1b[24;80R";
+        let replies: Vec<(usize, usize)> = s.split('R').filter_map(parse_dsr).collect();
+        assert_eq!(replies, vec![(7, 3), (24, 80)]);
     }
 }
