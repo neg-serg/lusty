@@ -218,8 +218,8 @@ impl App {
     }
 
     /// Override the popup size. CLI flags win over LUSTY_ROWS/LUSTY_WIDTH
-    /// env vars; None keeps the default (14 outer rows, full terminal
-    /// columns, i.e. 12 content rows and 100 content columns).
+    /// env vars; None keeps the default (18 outer rows, full terminal
+    /// columns, i.e. 16 content rows and 100 content columns).
     /// Apply eza-style order tweaks to in-memory listings.
     pub fn set_sort(&mut self, reverse: bool, dirs_first: bool) {
         self.reverse = reverse;
@@ -968,7 +968,7 @@ impl App {
             col_w = lw;
         }
         let bg = "48;2;0;0;0"; // opaque black popup background
-        let border = "38;2;108;126;150"; // #6c7e96 border colour
+        let border = "38;2;58;68;84"; // #3a4454 frame, darker than the meta text
         let revert = format!("{esc}[22;23;24;39;{bg}m"); // default fg on popup bg
         let mut frame = String::with_capacity((w + 64) * (bh + 2));
 
@@ -1180,8 +1180,8 @@ impl App {
     }
 }
 
-/// Outer popup height: two border rows plus up to 12 content rows.
-const OUTER_ROWS: usize = 14;
+/// Outer popup height: two border rows plus up to 16 content rows.
+const OUTER_ROWS: usize = 18;
 
 /// Selection theme loaded from the Lusty TOML (env `LUSTY_THEME`; by default
 /// the nvim copy at `$XDG_CONFIG_HOME/nvim/lua/lusty/theme.toml`, then the

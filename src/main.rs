@@ -81,7 +81,7 @@ fn main() {
   root      start directory (default: current)
   --depth N listing depth (default 2)
   --skip a,b  directories skipped (default pic,tmp)
-  --rows N  popup total height incl borders (default 14)
+  --rows N  popup total height incl borders (default 18)
   --width N popup total width incl borders (default: full terminal width)
   --icons   nerd-font icons (also LUSTY_ICONS=1)
   --query Q start with Q typed in the prompt
