@@ -113,9 +113,14 @@ version = "0.1.0"
 dependencies = [
  "crossterm",
  "libc",
+ "lusty-fuzzy",
  "rayon",
  "walkdir",
 ]
+
+[[package]]
+name = "lusty-fuzzy"
+version = "0.1.0"
 
 [[package]]
 name = "mio"
