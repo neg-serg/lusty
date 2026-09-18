@@ -6,8 +6,8 @@
 //! shallower-first, then by score. A query of exactly "." reveals dot files:
 //! the prefix anchor is skipped (any basename may match).
 
-use crate::fuzzy;
 use crate::listing::Entry;
+use lusty_fuzzy::scorer as fuzzy;
 use std::collections::HashMap;
 use std::path::Path;
 

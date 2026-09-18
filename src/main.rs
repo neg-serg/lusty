@@ -6,7 +6,6 @@
 
 mod cache;
 mod colors;
-mod fuzzy;
 mod glob;
 mod listing;
 mod mount;
@@ -33,6 +32,61 @@ fn main() {
                 }
             }
         }
+        return;
+    }
+    if args.first().map(|s| s.as_str()) == Some("--fuzzy-vectors") {
+        // Golden-vector dump for out-of-process ports of lusty-fuzzy (the
+        // quickshell tray menu keeps a JS port; scripts/dev/check-fuzzy-parity.mjs
+        // replays this output against it). Reads the corpus from --corpus or stdin.
+        let mut opts = lusty_fuzzy::RankOpts::for_menus();
+        let mut corpus: Option<String> = None;
+        let mut i = 1;
+        while i < args.len() {
+            match args[i].as_str() {
+                "--corpus" => {
+                    i += 1;
+                    corpus = args.get(i).cloned();
+                }
+                "--anchor" => {
+                    i += 1;
+                    opts.anchor = match args.get(i).map(|s| s.as_str()) {
+                        Some("prefix-on-first") | Some("prefix") => {
+                            lusty_fuzzy::Anchor::PrefixOnFirst
+                        }
+                        _ => lusty_fuzzy::Anchor::None,
+                    };
+                }
+                "--layout" => {
+                    i += 1;
+                    opts.layout = match args.get(i).map(|s| s.as_str()) {
+                        Some("off") => lusty_fuzzy::Layout::Off,
+                        _ => lusty_fuzzy::Layout::RuToEnFallback,
+                    };
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        let text = match corpus {
+            Some(path) => match std::fs::read_to_string(&path) {
+                Ok(t) => t,
+                Err(e) => {
+                    eprintln!("lusty --fuzzy-vectors: {path}: {e}");
+                    std::process::exit(1);
+                }
+            },
+            None => {
+                use std::io::Read;
+                let mut buf = String::new();
+                std::io::stdin().read_to_string(&mut buf).ok();
+                buf
+            }
+        };
+        let (labels, queries) = lusty_fuzzy::vectors::parse_corpus(&text);
+        print!(
+            "{}",
+            lusty_fuzzy::vectors::vectors_json(&labels, &queries, opts)
+        );
         return;
     }
     if args.first().map(|s| s.as_str()) == Some("--icon-map") {

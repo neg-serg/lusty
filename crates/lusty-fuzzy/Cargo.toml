@@ -1,0 +1,10 @@
+[package]
+name = "lusty-fuzzy"
+version = "0.1.0"
+edition = "2021"
+description = "fzy-style fuzzy scoring, match spans and query ranking (shared core of lusty)"
+license = "MIT"
+
+# Intentionally dependency-free: the hot path is a hand-rolled DP over bytes and
+# consumers (the pickers, the quickshell tray) must be able to use it anywhere.
+[dependencies]

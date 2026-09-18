@@ -1,0 +1,56 @@
+# lusty-fuzzy golden corpus — menu-shaped labels.
+#
+# Consumed by two sides:
+#   * tests/vectors.rs        (crate invariants: spans vs score, determinism)
+#   * `lusty --fuzzy-vectors` (JSON dump that the quickshell tray port, in the
+#     nixos repo, is replayed against by scripts/dev/check-fuzzy-parity.mjs)
+#
+# Keep labels short and menu-like; add a query whenever a case deserves to be
+# pinned (anchor behaviour, RU layout, Cyrillic labels, unicode widths).
+
+label: Open in browser
+label: Open in terminal
+label: Copy address
+label: Copy message
+label: Lock screen
+label: Log out
+label: Take screenshot
+label: Show hidden files
+label: Toggle Wi-Fi
+label: Turn off Bluetooth
+label: Preferences
+label: Power off
+label: Restart
+label: Suspend
+label: Recent documents
+label: Attach file
+label: Mark as read
+label: Mute notifications
+label: Check for updates
+label: Quit Telegram
+label: About
+label: Показать скрытые файлы
+label: Настройки
+label: Заблокировать экран
+
+# Latin queries: prefix, mid-word, abbreviation, single letter.
+query: op
+query: o
+query: b
+query: copy
+query: cp
+query: lock
+query: sc
+query: mrs
+query: quit
+
+# RU layout typed by accident, same physical keys as "op" / "lock".
+query: щз
+query: дщсл
+
+# Cyrillic queries must match the Cyrillic labels literally.
+query: скр
+query: настр
+
+# No match at all: the model must come back empty, not unfiltered.
+query: zzzz

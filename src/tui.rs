@@ -16,68 +16,10 @@ use crossterm::terminal::{self};
 use crate::cache;
 use crate::colors::{self, Colors};
 use crate::listing::{Entry, FileKind, Options};
+// The RU→EN table lives in the shared crate now (mirrored by the Lua front-end
+// through `lusty --ru-map`); re-exported so call sites keep their names.
 use crate::rank;
-
-/// RU (йцукен) to EN characters, matching the Lua port's table. Physical
-/// keys under the RU layout produce Cyrillic; map them back to the EN query
-/// character (the '.' key produces 'ю' which maps to '.'; there is no '/'
-/// row because it would override the dot).
-pub fn ru_to_en(c: char) -> Option<char> {
-    let en = match c {
-        'й' => 'q',
-        'ц' => 'w',
-        'у' => 'e',
-        'к' => 'r',
-        'е' => 't',
-        'н' => 'y',
-        'г' => 'u',
-        'ш' => 'i',
-        'щ' => 'o',
-        'з' => 'p',
-        'х' => '[',
-        'ъ' => ']',
-        'ф' => 'a',
-        'ы' => 's',
-        'в' => 'd',
-        'а' => 'f',
-        'п' => 'g',
-        'р' => 'h',
-        'о' => 'j',
-        'л' => 'k',
-        'д' => 'l',
-        'ж' => ';',
-        'э' => '\'',
-        'я' => 'z',
-        'ч' => 'x',
-        'с' => 'c',
-        'м' => 'v',
-        'и' => 'b',
-        'т' => 'n',
-        'ь' => 'm',
-        'б' => ',',
-        'ю' => '.',
-        _ => return None,
-    };
-    Some(en)
-}
-
-pub fn normalize_query_char(c: char) -> Option<char> {
-    // Lowercase RU letters map to lowercase EN; uppercase RU letters (Shift)
-    // map to uppercase EN so case-insensitive matching still sees the letter.
-    let lower = c.to_lowercase().next().unwrap_or(c);
-    let mapped = ru_to_en(lower).unwrap_or(lower);
-    let out = if c.is_uppercase() {
-        mapped.to_uppercase().next().unwrap_or(mapped)
-    } else {
-        mapped
-    };
-    // Accept printable ASCII (32..=126); punctuation is a regular query char.
-    if out.is_ascii_graphic() || out == ' ' {
-        Some(out)
-    } else {
-        None
-    }
-}
+pub use lusty_fuzzy::layout::{normalize_query_char, ru_to_en};
 
 /// Kitty graphics protocol support: `LUSTY_KITTY` overrides (`0` disables),
 /// otherwise auto-detected from the environment (kitty sets `KITTY_WINDOW_ID`
