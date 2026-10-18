@@ -96,15 +96,18 @@ the client only sends `V` after seeing `X preview`.
 ## Tests
 
 ```
-cargo test
+cargo test --workspace
 ```
 
-Unit tests cover ranking/colors/listing/cache/preview; `tests/serve_m.rs`
+Unit tests cover ranking/colors/listing/cache/preview and live in
+`crates/lusty-core` (the bin keeps only the TUI and serve tests, so the
+workspace flag is what runs them all); `tests/serve_m.rs`
 exercises the real binary over pipes (ranking memo, metadata requests, sort
 cycling), `tests/serve_escape.rs` covers the escaping and non-UTF8 path
 round-trip, `tests/serve_frec.rs` the frecency-ordered empty query and
 `tests/serve_preview.rs` the `V` framing and clipping. CI (GitHub Actions) runs
-`cargo fmt --check`, `cargo clippy --all-targets -- -D warnings` and `cargo test`.
+`cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`
+and `cargo test --workspace`.
 
 `--ru-map` / `--icon-map` / `--theme-map` / `--color-map` dump the shared
 tables, the resolved theme and LS_COLORS probes for the nvim parity smokes
