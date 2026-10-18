@@ -430,14 +430,16 @@ fn dummy_entry() -> Entry {
     }
 }
 
-/// Parallel stat of every entry (root.join(label)); size or mtime as i128.
+/// Parallel stat of every entry (via `Entry::path`); size or mtime as i128.
 fn meta_keys(root: &Path, entries: &[Entry], by_time: bool) -> Vec<i128> {
     use std::os::unix::fs::MetadataExt;
     walk_pool().install(|| {
         entries
             .par_iter()
             .map(|e| {
-                std::fs::metadata(root.join(&e.label))
+                // Raw bytes, not the lossy label: a non-UTF8 name must still
+                // stat, otherwise size/time would read as 0 for it.
+                std::fs::metadata(e.path(root))
                     .map(|m| {
                         if by_time {
                             m.mtime() as i128
@@ -615,11 +617,17 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(dir.join(".hid")).unwrap();
         fs::write(dir.join(".hidden"), b"x").unwrap();
+        // A marker inside the hidden dir proves the subtree is not walked:
+        // without it the assertion below would pass vacuously.
+        fs::write(dir.join(".hid/marker.txt"), b"x").unwrap();
         let entries = list(&dir, &opts(2, vec![], false));
         let names: Vec<&str> = entries.iter().map(|e| e.basename()).collect();
         assert!(!names.contains(&".hidden"));
         assert!(!names.contains(&".hid"));
-        assert!(!names.contains(&"marker.txt"), "hidden dir not traversed");
+        assert!(
+            !names.contains(&"marker.txt"),
+            "hidden dir contents are not traversed"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -657,6 +665,31 @@ mod tests {
         assert_ne!(e.label.as_bytes(), b"caf\xe9.txt");
         assert_eq!(e.path(&dir), file);
         assert!(e.path(&dir).exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn meta_sort_stats_non_utf8_names() {
+        use std::os::unix::ffi::OsStrExt;
+        let dir = std::env::temp_dir().join("lusty_native_meta_nonutf8_test");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("a-small.txt"), b"x").unwrap();
+        fs::write(
+            dir.join(std::ffi::OsStr::from_bytes(b"z\xe9-big.bin")),
+            vec![0u8; 100],
+        )
+        .unwrap();
+
+        let mut entries = list(&dir, &opts(1, vec![], false));
+        sort_by_meta(&dir, &mut entries, false);
+        assert_eq!(
+            entries[0].raw_basename(),
+            b"z\xe9-big.bin",
+            "100-byte non-UTF8 file must outrank the 1-byte one, not stat as 0"
+        );
+        let line = meta_line(&entries[0].path(&dir), 4).expect("size field");
+        assert_eq!(line.trim(), "100");
         let _ = fs::remove_dir_all(&dir);
     }
 
