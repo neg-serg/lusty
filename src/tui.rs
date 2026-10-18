@@ -1639,6 +1639,27 @@ mod grid_test {
     }
 
     #[test]
+    fn cells_read_down_then_right() {
+        // The screen for a..f with 3 rows and 2 columns must read
+        //   a  d
+        //   b  e
+        //   c  f
+        // i.e. down the first column first. The transposed layout
+        // (a b / c d / e f) is what `draw` used to produce while the arrow
+        // keys already moved column-wise.
+        let labels = ["a", "b", "c", "d", "e", "f"];
+        let (rows, cols) = (3, 2);
+        let screen: Vec<String> = (0..rows)
+            .map(|r| {
+                (0..cols)
+                    .map(|c| labels[grid_index(0, rows, r, c)])
+                    .collect()
+            })
+            .collect();
+        assert_eq!(screen, ["ad", "be", "cf"]);
+    }
+
+    #[test]
     fn column_nav_moves_between_columns_and_wraps() {
         // 7 entries, 3 rows -> 3 columns, the last one short (row 0 only).
         assert_eq!(column_target(0, 1, 7, 3), 3, "right: next column, same row");
