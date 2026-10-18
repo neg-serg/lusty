@@ -15,14 +15,14 @@ bin="$repo_root/target/release/lusty"
 depth="${BENCH_DEPTH:-2}"
 roots="${BENCH_ROOTS:-$repo_root /etc/nixos}"
 
-echo "lusty --list, depth $depth"
+echo "lusty --list, depth $depth (LUSTY_CACHE=0: walks, not cache reads)"
 if command -v hyperfine > /dev/null 2>&1; then
   hyperfine --warmup 2 --runs "${BENCH_RUNS:-10}" -N -L root "$roots" \
-    "$bin --list {root} --depth $depth"
+    "LUSTY_CACHE=0 $bin --list {root} --depth $depth"
 else
   for root in $roots; do
     t0=$(date +%s%N)
-    "$bin" --list "$root" --depth "$depth" > /dev/null 2>&1 || true
+    LUSTY_CACHE=0 "$bin" --list "$root" --depth "$depth" > /dev/null 2>&1 || true
     t1=$(date +%s%N)
     printf '  %-24s %s ms\n' "$root" "$(( (t1 - t0) / 1000000 ))"
   done
