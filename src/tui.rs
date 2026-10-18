@@ -79,6 +79,36 @@ fn store_history(query: &str) {
     let _ = std::fs::write(path, format!("{query}\n"));
 }
 
+/// Entry layout of the standalone popup: a plain single column, an adaptive
+/// multi-column grid, or the eza -l style rows with mode/size/date.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ViewMode {
+    List,
+    Grid,
+    Long,
+}
+
+impl ViewMode {
+    /// Parse the CLI/env spelling (`list`, `grid`, `long`).
+    pub fn parse(s: &str) -> Option<ViewMode> {
+        match s.trim() {
+            "list" => Some(ViewMode::List),
+            "grid" => Some(ViewMode::Grid),
+            "long" => Some(ViewMode::Long),
+            _ => None,
+        }
+    }
+
+    /// Next mode for the C-l cycle: list -> grid -> long -> list.
+    pub fn next(self) -> ViewMode {
+        match self {
+            ViewMode::List => ViewMode::Grid,
+            ViewMode::Grid => ViewMode::Long,
+            ViewMode::Long => ViewMode::List,
+        }
+    }
+}
+
 pub struct App {
     root: PathBuf,
     opts: Options,
@@ -96,7 +126,7 @@ pub struct App {
     pop_top: usize,          // 0-based screen row of the popup top border
     ui_rows: Option<usize>,  // user popup height (outer rows incl borders)
     ui_width: Option<usize>, // user popup width (outer columns incl borders)
-    long: bool,              // eza -l style: one entry per row with mode/size/date
+    view: ViewMode,          // list (one column), grid (adaptive) or long (meta rows)
     icons: bool,             // nerd-font icons per entry + dir icon before the prompt
     reverse: bool,           // eza --reverse per depth
     dirs_first: bool,        // eza --group-dirs-first
@@ -136,7 +166,7 @@ impl App {
             pop_top: 0,
             ui_rows: None,
             ui_width: None,
-            long: false,
+            view: ViewMode::Grid,
             icons: std::env::var("LUSTY_ICONS")
                 .map(|v| v == "1")
                 .unwrap_or(false),
@@ -189,9 +219,9 @@ impl App {
         }
     }
 
-    /// Enable the long listing view (mode/size/date + name per row).
-    pub fn set_long(&mut self, on: bool) {
-        self.long = on;
+    /// Set the entry layout (CLI `--view`/`--long`, `LUSTY_VIEW`).
+    pub fn set_view(&mut self, view: ViewMode) {
+        self.view = view;
     }
 
     /// Enable nerd-font icons (CLI flag; `LUSTY_ICONS=1` also enables them).
@@ -611,6 +641,15 @@ impl App {
         needed.min(byw).clamp(1, 8)
     }
 
+    /// Entry columns for the current view: the grid adapts to the popup, the
+    /// list and long views are a single column.
+    fn view_cols(&mut self) -> usize {
+        match self.view {
+            ViewMode::Grid => self.max_cols(),
+            ViewMode::List | ViewMode::Long => 1,
+        }
+    }
+
     fn col_width(&mut self) -> usize {
         let cols = self.max_cols();
         let w = self.content_w();
@@ -740,10 +779,10 @@ impl App {
     }
 
     /// Keep the selected entry inside the visible column-major window (see
-    /// `grid_offset`); the window start stays on a column boundary. The long
-    /// view renders a single column, so its window is `rows` cells wide.
+    /// `grid_offset`); the window start stays on a column boundary. The list
+    /// and long views render a single column, so their window is `rows` wide.
     fn clamp_offset(&mut self, rows: usize) {
-        let cols = if self.long { 1 } else { self.max_cols() };
+        let cols = self.view_cols();
         self.offset = grid_offset(self.selected, self.offset, self.ranked.len(), rows, cols);
     }
 
@@ -805,7 +844,8 @@ impl App {
                                     }
                                 }
                             }
-                            (KeyCode::Char('l'), true) => self.long = !self.long,
+                            // C-l cycles the entry layout list -> grid -> long.
+                            (KeyCode::Char('l'), true) => self.view = self.view.next(),
                             // C-y cycles the sort order like the nvim float: drop
                             // the cached listing so the next draw re-sorts it.
                             (KeyCode::Char('y'), true) => {
@@ -908,7 +948,9 @@ impl App {
         }
     }
 
-    fn draw(&mut self, out: &mut io::Stdout) -> io::Result<()> {
+    /// Render one frame. Generic over the writer so tests can render into a
+    /// buffer and assert the layout without a terminal.
+    fn draw<W: Write>(&mut self, out: &mut W) -> io::Result<()> {
         self.ensure_ranked();
         if self.preview_on {
             self.refresh_pane();
@@ -920,12 +962,14 @@ impl App {
         let top = self.pop_top;
         let bh = self.box_h;
         let rows = self.list_rows();
-        let mut cols = self.max_cols();
-        let mut col_w = self.col_width();
-        if self.long {
-            cols = 1;
-            col_w = lw;
-        }
+        // The grid adapts to the popup; the list and long views use one
+        // full-width column.
+        let cols = self.view_cols();
+        let col_w = if self.view == ViewMode::Grid {
+            self.col_width()
+        } else {
+            lw
+        };
         let bg = "48;2;0;0;0"; // opaque black popup background
         let border = "38;2;58;68;84"; // #3a4454 frame, darker than the meta text
         let revert = format!("{esc}[22;23;24;39;{bg}m"); // default fg on popup bg
@@ -956,7 +1000,7 @@ impl App {
                     if pos < self.ranked.len() {
                         let i = self.ranked[pos];
                         let e = self.listing()[i].clone();
-                        if self.long {
+                        if self.view == ViewMode::Long {
                             if let Some(m) =
                                 lusty_core::listing::meta_line(&e.path(&root_path), self.cols_mask)
                             {
@@ -1719,6 +1763,180 @@ mod grid_test {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod view_test {
+    use super::*;
+
+    #[test]
+    fn parses_the_cli_spellings() {
+        assert_eq!(ViewMode::parse("list"), Some(ViewMode::List));
+        assert_eq!(ViewMode::parse("grid"), Some(ViewMode::Grid));
+        assert_eq!(ViewMode::parse("long"), Some(ViewMode::Long));
+        assert_eq!(ViewMode::parse(" grid "), Some(ViewMode::Grid));
+        assert_eq!(ViewMode::parse("fancy"), None);
+        assert_eq!(ViewMode::parse(""), None);
+    }
+
+    #[test]
+    fn the_cycle_visits_every_mode_once() {
+        let mut mode = ViewMode::List;
+        let seen: Vec<ViewMode> = (0..3)
+            .map(|_| {
+                let current = mode;
+                mode = mode.next();
+                current
+            })
+            .collect();
+        assert_eq!(seen, [ViewMode::List, ViewMode::Grid, ViewMode::Long]);
+        assert_eq!(mode, ViewMode::List, "the cycle returns to the start");
+    }
+
+    #[test]
+    fn list_and_long_are_one_column_while_grid_adapts() {
+        let dir = std::env::temp_dir().join("lusty_view_cols_test");
+        let _ = std::fs::create_dir_all(&dir);
+        let mut app = App::new(
+            dir.clone(),
+            Options {
+                depth: 1,
+                skip_dirs: vec![],
+                follow_mounts: false,
+                show_dots: false,
+            },
+        );
+        app.box_w = 120;
+        app.box_h = 8;
+        app.maxw = 8;
+        app.ranked = (0..40usize).collect(); // only the length matters here
+
+        app.view = ViewMode::Grid;
+        assert!(
+            app.view_cols() > 1,
+            "a wide popup with 40 entries packs columns"
+        );
+        app.view = ViewMode::List;
+        assert_eq!(app.view_cols(), 1, "list never splits into columns");
+        app.view = ViewMode::Long;
+        assert_eq!(app.view_cols(), 1, "long keeps one entry per line");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Split a rendered frame into visual rows: the frame is one string and
+    /// every row starts with a `ESC[<row>;1H` cursor move, everything else is
+    /// SGR styling or an erase.
+    fn frame_rows(app: &mut App) -> Vec<String> {
+        let mut buf: Vec<u8> = Vec::new();
+        app.draw(&mut buf).expect("render into a buffer");
+        let text = String::from_utf8_lossy(&buf);
+        let mut rows: Vec<String> = Vec::new();
+        let mut cur = String::new();
+        let mut chars = text.chars();
+        while let Some(ch) = chars.next() {
+            if ch != char::from_u32(0x1b).unwrap() {
+                cur.push(ch);
+                continue;
+            }
+            if chars.next() != Some('[') {
+                continue;
+            }
+            let mut final_byte = None;
+            for n in chars.by_ref() {
+                if n.is_ascii_alphabetic() || n == '~' {
+                    final_byte = Some(n);
+                    break;
+                }
+            }
+            if final_byte == Some('H') && !cur.is_empty() {
+                rows.push(std::mem::take(&mut cur));
+            }
+        }
+        if !cur.is_empty() {
+            rows.push(cur);
+        }
+        rows
+    }
+
+    /// Fixture with 20 entries. The directory is per test (`tag`): the tests
+    /// run in parallel, and a shared temp dir had them deleting each other's
+    /// listing mid-render.
+    fn layout_fixture(tag: &str) -> (App, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!("lusty_mode_layout_{tag}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for i in 0..20 {
+            std::fs::write(dir.join(format!("f{i:02}.txt")), b"x").unwrap();
+        }
+        let mut app = App::new(
+            dir.clone(),
+            Options {
+                depth: 1,
+                skip_dirs: vec![],
+                follow_mounts: false,
+                show_dots: false,
+            },
+        );
+        app.box_w = 60;
+        app.box_h = 8; // 5 entry rows
+        app.pop_top = 0;
+        app.kitty = false;
+        // A history file from a previous run must not filter the fixture.
+        app.query.clear();
+        app.needs_rank = true;
+        (app, dir)
+    }
+
+    #[test]
+    fn list_renders_one_entry_per_row() {
+        let (mut app, dir) = layout_fixture("list");
+        app.view = ViewMode::List;
+        let rows = frame_rows(&mut app);
+        let hits: Vec<&String> = rows.iter().filter(|r| r.contains(".txt")).collect();
+        assert_eq!(hits.len(), 5, "list fills every entry row: {rows:?}");
+        for row in hits {
+            assert_eq!(
+                row.matches(".txt").count(),
+                1,
+                "one entry per row in list mode: {row:?}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn grid_packs_several_entries_per_row() {
+        let (mut app, dir) = layout_fixture("grid");
+        app.view = ViewMode::Grid;
+        let rows = frame_rows(&mut app);
+        let widest = rows
+            .iter()
+            .map(|r| r.matches(".txt").count())
+            .max()
+            .unwrap_or(0);
+        assert!(
+            widest >= 2,
+            "grid must pack columns, widest row had {widest}: {rows:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn long_prepends_the_meta_fields() {
+        let (mut app, dir) = layout_fixture("long");
+        app.view = ViewMode::Long;
+        let rows = frame_rows(&mut app);
+        let hit = rows
+            .iter()
+            .find(|r| r.contains(".txt"))
+            .expect("an entry row");
+        assert!(
+            hit.contains("-rw"),
+            "long rows start with a perm field: {hit:?}"
+        );
+        assert_eq!(hit.matches(".txt").count(), 1, "one entry per line");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 

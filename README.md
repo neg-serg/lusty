@@ -48,14 +48,21 @@ Nix: `nix build .#lusty` (via `default.nix`,
 
 ```
 lusty [root] [--depth N] [--skip a,b] [--rows N] [--width N]
-            [--long] [--sort name|ext|size|time] [--reverse] [--dirs-first]
-            [--columns perm,user,size,time]
+            [--view list|grid|long] [--sort name|ext|size|time] [--reverse]
+            [--dirs-first] [--columns perm,user,size,time]
 ```
 
 Enter/Tab opens, C-t/C-o/C-v open in tabs/splits, C-n/C-p move, C-u clears,
-Esc/C-c/C-g cancels, C-l toggles the long view, C-y cycles the sort order
+Esc/C-c/C-g cancels, C-l cycles the layout (list → grid → long; `--view` or
+`LUSTY_VIEW` picks the start, `--long` is an alias for `--view long`), C-y
+cycles the sort order
 (name/ext/size/time; `--sort` picks the starting order), C-d cycles the search
 depth (1..6). The last typed query is restored on the next run.
+
+`list` is one entry per row, `grid` (the default) packs as many adaptive
+columns as the popup width allows — filled top-to-bottom, columns left to
+right — and `long` puts the eza `-l` style mode/size/date in front of each
+name.
 
 ## serve protocol
 
