@@ -977,8 +977,11 @@ impl App {
                             cell.push_str(icon_for(&e));
                             cell.push(' ');
                         }
-                        if let Some((ms, me)) = query_match(&e.label, &self.query) {
-                            cell.push_str(&e.label[..ms]);
+                        // Terminal-safe display copy: a crafted file name with
+                        // ESC must not inject control sequences into the frame.
+                        let label = sanitize_display(&e.label);
+                        if let Some((ms, me)) = query_match(&label, &self.query) {
+                            cell.push_str(&label[..ms]);
                             let mt = theme();
                             if let Some([r, g, b]) = mt.match_fg {
                                 cell.push_str(&format!("{esc}[38;2;{r};{g};{b}m"));
@@ -986,16 +989,16 @@ impl App {
                             if mt.match_underline {
                                 cell.push_str(&format!("{esc}[4m"));
                             }
-                            cell.push_str(&e.label[ms..me]);
+                            cell.push_str(&label[ms..me]);
                             if mt.match_underline {
                                 cell.push_str(&format!("{esc}[24m"));
                             }
                             if mt.match_fg.is_some() {
                                 cell.push_str(&format!("{esc}[39m"));
                             }
-                            cell.push_str(&e.label[me..]);
+                            cell.push_str(&label[me..]);
                         } else {
-                            cell.push_str(&e.label);
+                            cell.push_str(&label);
                         }
                         if e.kind == FileKind::Dir && !self.icons {
                             cell.push('/');
@@ -1109,14 +1112,23 @@ impl App {
         };
         let mut path = self.root.display().to_string();
         if let Ok(home) = std::env::var("HOME") {
-            if path.starts_with(&home) {
-                path = format!("~{}", &path[home.len()..]);
+            let home = home.trim_end_matches('/');
+            if !home.is_empty() && path.starts_with(home) {
+                let rest = &path[home.len()..];
+                // Only a component boundary counts: with HOME=/home/neg the
+                // path /home/negwork must not become ~work.
+                if rest.is_empty() {
+                    path = "~".to_string();
+                } else if rest.starts_with('/') {
+                    path = format!("~{rest}");
+                }
             }
         }
         if let Some(rest) = path.strip_prefix('~') {
             push_painted("~", "38;2;40;115;115", &mut out);
             path = rest.to_string();
         }
+        let path = sanitize_display(&path);
         let mut current = String::new();
         for ch in path.chars() {
             if ch == '/' {
@@ -1412,6 +1424,29 @@ pub(crate) fn str_width(s: &str) -> usize {
     s.chars().map(char_width).sum()
 }
 
+/// Terminal-safe copy of a label or path for the frame: a byte like ESC in a
+/// file name would otherwise let the file inject control sequences into the
+/// terminal. Returns the input unchanged (borrowed) when there is nothing to
+/// sanitize; TAB becomes a space, any other control char a '?'.
+fn sanitize_display(s: &str) -> std::borrow::Cow<'_, str> {
+    if !s.chars().any(char::is_control) {
+        return std::borrow::Cow::Borrowed(s);
+    }
+    std::borrow::Cow::Owned(
+        s.chars()
+            .map(|c| {
+                if c == '\t' {
+                    ' '
+                } else if c.is_control() {
+                    '?'
+                } else {
+                    c
+                }
+            })
+            .collect(),
+    )
+}
+
 pub(crate) fn ansi_pad(line: &mut String, width: usize) {
     let src: Vec<char> = line.chars().collect();
     let mut out = String::with_capacity(src.len() + width);
@@ -1688,6 +1723,14 @@ mod width_test {
         let mut s = String::from("中");
         ansi_pad(&mut s, 4);
         assert_eq!(s, "中  ");
+    }
+
+    #[test]
+    fn sanitize_display_strips_controls() {
+        // ESC and friends in a file name must never reach the frame.
+        assert_eq!(sanitize_display("plain name.txt"), "plain name.txt");
+        assert_eq!(sanitize_display("a\u{1b}[2Jb\tc"), "a?[2Jb c");
+        assert_eq!(sanitize_display("суб/файл.txt"), "суб/файл.txt");
     }
 
     #[test]
