@@ -10,11 +10,11 @@ name = "lusty"
 path = "src/main.rs"
 
 [dependencies]
+lusty-core = { path = "crates/lusty-core" }
 lusty-fuzzy = { path = "crates/lusty-fuzzy" }
-rayon = "1"
 crossterm = "0.28"
 libc = "0.2"
 
 [workspace]
-members = [".", "crates/lusty-fuzzy"]
+members = [".", "crates/lusty-fuzzy", "crates/lusty-core"]
 resolver = "2"

@@ -113,6 +113,15 @@ version = "0.1.0"
 dependencies = [
  "crossterm",
  "libc",
+ "lusty-core",
+ "lusty-fuzzy",
+]
+
+[[package]]
+name = "lusty-core"
+version = "0.1.0"
+dependencies = [
+ "libc",
  "lusty-fuzzy",
  "rayon",
 ]

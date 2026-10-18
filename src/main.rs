@@ -5,13 +5,6 @@
 //! headless line-protocol backend for the nvim float) and the standalone
 //! raw-mode TUI (grid/long views, preview pane, RU/EN layout).
 
-mod cache;
-mod colors;
-mod glob;
-mod listing;
-mod mount;
-mod preview;
-mod rank;
 mod serve;
 mod tui;
 
@@ -19,7 +12,8 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::time::Instant;
 
-use listing::FileKind;
+use lusty_core::listing::{self, FileKind};
+use lusty_core::{cache, colors, rank};
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
