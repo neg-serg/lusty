@@ -1,8 +1,9 @@
 //! lusty: native file/buffer picker for Neovim.
 //!
-//! Phase 1-3: --list mode (benchmark + plumbing) with depth/skip/mount
-//! semantics, query ranking and LS_COLORS-aware coloring. The TUI lands in a
-//! later phase.
+//! Three front-ends share the listing stack: `--list` (benchmark/plumbing,
+//! depth/skip/mount semantics, ranking, LS_COLORS coloring), `serve` (the
+//! headless line-protocol backend for the nvim float) and the standalone
+//! raw-mode TUI (grid/long views, preview pane, RU/EN layout).
 
 mod cache;
 mod colors;
@@ -131,14 +132,28 @@ fn main() {
     if args.iter().any(|a| a == "-h" || a == "--help") {
         println!(
             "usage: lusty [root] [--depth N] [--skip a,b] [--rows N] [--width N]
+                [--long] [--sort name|ext|size|time] [--reverse] [--dirs-first]
+                [--columns perm,user,size,time] [--icons] [--query Q]
+                [--view list|long]
+       lusty serve [root] [--depth N] [--skip a,b] [--dots] [--follow-mounts]
+       lusty --list [root] [--depth N] [--skip a,b] [--query Q] [--color]
+                [--sort ...] [--reverse] [--dirs-first] [--show-dots]
 
   root      start directory (default: current)
   --depth N listing depth (default 2)
   --skip a,b  directories skipped (default pic,tmp)
   --rows N  popup total height incl borders (default 8)
   --width N popup total width incl borders (default: full terminal width)
+  --long    start in the eza -l style long view (also LUSTY_VIEW=long)
+  --view M  list (default) or long
+  --sort S  start order: name (default), ext, size (desc), time (desc)
+  --reverse reverse each depth group (eza --reverse)
+  --dirs-first  group directories first per depth
+  --columns C   long-view fields: perm,user,size,time (default all)
   --icons   nerd-font icons (also LUSTY_ICONS=1)
   --query Q start with Q typed in the prompt
+
+  serve: line protocol on stdin/stdout for the nvim client (see README)
 
   --ru-map     print the RU->EN key table (parity smoke)
   --icon-map   print the icon table (parity smoke)
@@ -172,7 +187,7 @@ command-line flags win.
                     i += 1;
                     skip = args.get(i).cloned().unwrap_or_default();
                 }
-                "--dots" => show_dots = true,
+                "--dots" | "--show-dots" => show_dots = true,
                 "--follow-mounts" => follow_mounts = true,
                 other if !other.starts_with("--") => {
                     root = PathBuf::from(other);
