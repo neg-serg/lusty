@@ -55,27 +55,28 @@ fn state_dir() -> Option<PathBuf> {
     Some(base.join("lusty"))
 }
 
-/// FNV-1a over the listing key: root, depth, skip list, dots flag.
+/// FNV-1a over the listing key: root, depth, skip list, dots flag. Every
+/// component is length-prefixed, so no two different (root, skip, flags)
+/// combinations can collide by smuggling a separator into a component
+/// (e.g. skip `["a|b"]` vs `["a", "b"]`).
 fn key_hash(root: &Path, opts: &Options) -> u64 {
-    let mut h: u64 = 0xcbf29ce484222325;
-    let mut mix = |bytes: &[u8]| {
-        for &b in bytes {
-            h ^= b as u64;
-            h = h.wrapping_mul(0x100000001b3);
+    fn mix(h: &mut u64, bytes: &[u8]) {
+        for &b in &(bytes.len() as u64).to_le_bytes() {
+            *h ^= b as u64;
+            *h = h.wrapping_mul(0x100000001b3);
         }
-    };
-    mix(root.as_os_str().as_encoded_bytes());
-    mix(&[b'|', opts.depth as u8]);
+        for &b in bytes {
+            *h ^= b as u64;
+            *h = h.wrapping_mul(0x100000001b3);
+        }
+    }
+    let mut h: u64 = 0xcbf29ce484222325;
+    mix(&mut h, root.as_os_str().as_encoded_bytes());
+    mix(&mut h, &opts.depth.to_le_bytes());
     for s in &opts.skip_dirs {
-        mix(b"|");
-        mix(s.as_bytes());
+        mix(&mut h, s.as_bytes());
     }
-    if opts.show_dots {
-        mix(b"|d");
-    }
-    if opts.follow_mounts {
-        mix(b"|f");
-    }
+    mix(&mut h, &[opts.show_dots as u8, opts.follow_mounts as u8]);
     h
 }
 
@@ -185,7 +186,10 @@ fn store(
         w.push(e.name0);
         put_bytes(&mut w, &e.rel_bytes);
     }
-    let tmp = path.with_extension("tmp");
+    // Per-process temp name: two lusty instances can cache the same key
+    // concurrently, and a shared temp file could interleave their writes
+    // before either rename lands.
+    let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
     fs::write(&tmp, &w)?;
     fs::rename(&tmp, path)?;
     Ok(())
@@ -413,5 +417,26 @@ mod tests {
 
         let _ = fs::remove_dir_all(&root);
         let _ = fs::remove_dir_all(&store_dir);
+    }
+
+    #[test]
+    fn key_hash_separates_components() {
+        let root = Path::new("/tmp/x");
+        let mk = |skip: Vec<&str>, depth: usize| Options {
+            depth,
+            skip_dirs: skip.into_iter().map(str::to_string).collect(),
+            follow_mounts: false,
+            show_dots: false,
+        };
+        assert_ne!(
+            key_hash(root, &mk(vec!["a|b"], 2)),
+            key_hash(root, &mk(vec!["a", "b"], 2)),
+            "a separator inside a component must not collide"
+        );
+        assert_ne!(
+            key_hash(root, &mk(vec![], 2)),
+            key_hash(root, &mk(vec![], 2 + 256)),
+            "depth is hashed at full width, not truncated to a byte"
+        );
     }
 }
