@@ -311,25 +311,12 @@ impl App {
         self.selected = ((self.selected as isize + delta).rem_euclid(n as isize)) as usize;
     }
 
+    /// Move `delta` whole columns in the column-major grid (see `grid_index`):
+    /// a column holds `row_count` entries, right wraps to the first column and
+    /// left to the last one. A target column shorter than the current row (the
+    /// listing does not fill the last column) clamps to the last entry.
     fn column_nav(&mut self, delta: isize, row_count: usize) {
-        let n = self.ranked_len();
-        if n == 0 || row_count == 0 {
-            self.selected = 0;
-            return;
-        }
-        let columns = n.div_ceil(row_count);
-        let cur_col = self.selected / row_count;
-        let cur_row = self.selected % row_count;
-        let columns_i = columns as isize;
-        let mut new_col = ((cur_col as isize) + delta).rem_euclid(columns_i);
-        if (new_col + 1) * (row_count as isize + 1) > n as isize {
-            new_col = if delta > 0 { 0 } else { (columns_i - 2).max(0) };
-        }
-        let mut s = new_col * row_count as isize + cur_row as isize;
-        if s >= n as isize {
-            s = n as isize - 1;
-        }
-        self.selected = s.max(0) as usize;
+        self.selected = column_target(self.selected, delta, self.ranked_len(), row_count);
     }
 
     /// '/' descends into a directory when the typed prefix uniquely names one
@@ -525,6 +512,47 @@ fn parse_dsr(part: &str) -> Option<(usize, usize)> {
     Some((row, col))
 }
 
+/// Column-major grid cell order shared by `draw`, `column_nav` and
+/// `clamp_offset`: the grid is `rows` entries tall, entries fill a column
+/// top-to-bottom and continue in the next column to the right; `offset` is the
+/// index of the cell at the top-left corner.
+fn grid_index(offset: usize, rows: usize, r: usize, c: usize) -> usize {
+    offset + c * rows + r
+}
+
+/// Target index for a left/right move of `delta` whole columns in the grid;
+/// wraps around the total column count and clamps when the target column is
+/// shorter than the current row (the listing does not fill the last column).
+fn column_target(selected: usize, delta: isize, n: usize, rows: usize) -> usize {
+    if n == 0 || rows == 0 {
+        return 0;
+    }
+    let total_cols = n.div_ceil(rows);
+    let cur_col = selected / rows;
+    let cur_row = selected % rows;
+    let new_col = (cur_col as isize + delta).rem_euclid(total_cols as isize) as usize;
+    (new_col * rows + cur_row).min(n - 1)
+}
+
+/// First index of the grid window that keeps `selected` visible. The window
+/// shows `cols` whole columns of `rows` entries and starts on a column
+/// boundary, so navigating never shifts cells by a single entry; it follows the
+/// selection only once the latter leaves the window.
+fn grid_offset(selected: usize, offset: usize, n: usize, rows: usize, cols: usize) -> usize {
+    if n == 0 || rows == 0 || cols == 0 {
+        return 0;
+    }
+    let total_cols = n.div_ceil(rows);
+    let max_offset = total_cols.saturating_sub(cols) * rows;
+    let mut off = (offset / rows) * rows;
+    if selected < off {
+        off = (selected / rows) * rows;
+    } else if selected >= off + rows * cols {
+        off = (selected / rows + 1 - cols) * rows;
+    }
+    off.min(max_offset)
+}
+
 impl App {
     /// Recompute the popup box size from the current screen size and the
     /// user overrides (--rows/--width or LUSTY_ROWS/LUSTY_WIDTH). Both
@@ -711,23 +739,12 @@ impl App {
         self.maxw
     }
 
+    /// Keep the selected entry inside the visible column-major window (see
+    /// `grid_offset`); the window start stays on a column boundary. The long
+    /// view renders a single column, so its window is `rows` cells wide.
     fn clamp_offset(&mut self, rows: usize) {
-        let n = self.ranked.len();
-        if n == 0 {
-            self.offset = 0;
-            return;
-        }
-        if self.selected < self.offset {
-            self.offset = self.selected;
-        } else if self.selected >= self.offset + rows {
-            self.offset = self.selected + 1 - rows;
-        }
-        if self.offset + rows > n && n >= rows {
-            self.offset = n - rows;
-        }
-        if self.offset > self.selected {
-            self.offset = self.selected;
-        }
+        let cols = if self.long { 1 } else { self.max_cols() };
+        self.offset = grid_offset(self.selected, self.offset, self.ranked.len(), rows, cols);
     }
 
     fn loop_events(&mut self, out: &mut io::Stdout) -> io::Result<i32> {
@@ -931,7 +948,10 @@ impl App {
             let mut line = String::new();
             if r < rows {
                 for c in 0..cols {
-                    let pos = self.offset + r * cols + c;
+                    // Column-major, the same mapping `grid_index` and the
+                    // column navigation use: the grid is `rows` cells tall and
+                    // grows to the right.
+                    let pos = grid_index(self.offset, rows, r, c);
                     let mut cell = String::new();
                     if pos < self.ranked.len() {
                         let i = self.ranked[pos];
@@ -1460,19 +1480,6 @@ mod tests {
 }
 
 #[cfg(test)]
-mod apad_test {
-    #[test]
-    fn ansi_pad_keeps_escapes() {
-        let esc = char::from_u32(0x1b).unwrap();
-        let mut s = format!("{}[48;2;0;95;175;1;38;2;209;229;255mdoc/{}[0m", esc, esc);
-        eprintln!("INPUT: {:?}", s);
-        super::ansi_pad(&mut s, 22);
-        eprintln!("OUT: {:?}", s);
-        eprintln!("CHARS: {:?}", s.chars().collect::<Vec<_>>());
-    }
-}
-
-#[cfg(test)]
 mod history_test {
     #[test]
     fn history_round_trips_and_disables() {
@@ -1578,6 +1585,84 @@ mod pane_test {
         std::env::set_var("LUSTY_KITTY", "1");
         assert!(kitty_enabled(), "explicit on");
         std::env::remove_var("LUSTY_KITTY");
+    }
+}
+
+#[cfg(test)]
+mod grid_test {
+    use super::*;
+
+    #[test]
+    fn cells_fill_columns_top_to_bottom() {
+        // 3 rows per column: index 1 is below index 0 and index 3 starts the
+        // second column at the same row (the fill order `draw` uses).
+        assert_eq!(grid_index(0, 3, 0, 0), 0);
+        assert_eq!(grid_index(0, 3, 1, 0), 1);
+        assert_eq!(grid_index(0, 3, 2, 0), 2);
+        assert_eq!(grid_index(0, 3, 0, 1), 3);
+        assert_eq!(grid_index(5, 3, 0, 1), 8);
+    }
+
+    #[test]
+    fn column_nav_moves_between_columns_and_wraps() {
+        // 7 entries, 3 rows -> 3 columns, the last one short (row 0 only).
+        assert_eq!(column_target(0, 1, 7, 3), 3, "right: next column, same row");
+        assert_eq!(column_target(1, 1, 7, 3), 4);
+        assert_eq!(column_target(3, 1, 7, 3), 6);
+        assert_eq!(column_target(6, 1, 7, 3), 0, "right wraps to column 0");
+        assert_eq!(
+            column_target(0, -1, 7, 3),
+            6,
+            "left wraps to the last column"
+        );
+        assert_eq!(column_target(2, 2, 7, 3), 6, "short target column clamps");
+        assert_eq!(column_target(0, 1, 0, 3), 0, "empty listing is a no-op");
+    }
+
+    #[test]
+    fn window_scrolls_by_whole_columns() {
+        // 12 entries, 5 rows, 2 visible columns: the first page is 0..10,
+        // the second starts at the third column (index 5).
+        assert_eq!(grid_offset(5, 0, 12, 5, 2), 0, "second column, same page");
+        assert_eq!(
+            grid_offset(10, 0, 12, 5, 2),
+            5,
+            "third column scrolls a page"
+        );
+        assert_eq!(grid_offset(11, 5, 12, 5, 2), 5, "last entry stays visible");
+        assert_eq!(
+            grid_offset(3, 5, 12, 5, 2),
+            0,
+            "scrolls back to the selection"
+        );
+        assert_eq!(
+            grid_offset(11, 0, 12, 5, 8),
+            0,
+            "everything fits: no scroll"
+        );
+    }
+
+    #[test]
+    fn selection_stays_visible_in_the_window() {
+        for n in 1..40 {
+            for rows in 1..8 {
+                for cols in 1..6 {
+                    for selected in 0..n {
+                        let offset = grid_offset(selected, 0, n, rows, cols);
+                        let rel = selected - offset;
+                        assert!(
+                            rel < rows * cols,
+                            "n={n} rows={rows} cols={cols} selected={selected} offset={offset}"
+                        );
+                        assert_eq!(
+                            grid_offset(selected, offset, n, rows, cols),
+                            offset,
+                            "idempotent for n={n} rows={rows} cols={cols} selected={selected}"
+                        );
+                    }
+                }
+            }
+        }
     }
 }
 
