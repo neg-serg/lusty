@@ -126,9 +126,9 @@ fn main() {
     if args.iter().any(|a| a == "-h" || a == "--help") {
         println!(
             "usage: lusty [root] [--depth N] [--skip a,b] [--rows N] [--width N]
-                [--long] [--sort name|ext|size|time] [--reverse] [--dirs-first]
-                [--columns perm,user,size,time] [--icons] [--query Q]
-                [--view list|long]
+                [--view list|grid|long] [--sort name|ext|size|time] [--reverse]
+                [--dirs-first] [--columns perm,user,size,time] [--icons]
+                [--query Q]
        lusty serve [root] [--depth N] [--skip a,b] [--dots] [--follow-mounts]
        lusty --list [root] [--depth N] [--skip a,b] [--query Q] [--color]
                 [--sort ...] [--reverse] [--dirs-first] [--show-dots]
@@ -138,8 +138,9 @@ fn main() {
   --skip a,b  directories skipped (default pic,tmp)
   --rows N  popup total height incl borders (default 8)
   --width N popup total width incl borders (default: full terminal width)
-  --long    start in the eza -l style long view (also LUSTY_VIEW=long)
-  --view M  list (default) or long
+  --long    same as --view long (eza -l style rows)
+  --view M  list (one column), grid (default, adaptive columns), or long;
+            also LUSTY_VIEW=list|grid|long, C-l cycles them in the picker
   --sort S  start order: name (default), ext, size (desc), time (desc)
   --reverse reverse each depth group (eza --reverse)
   --dirs-first  group directories first per depth
@@ -209,7 +210,7 @@ command-line flags win.
     let mut skip = "pic,tmp".to_string();
     let mut rows: Option<usize> = None;
     let mut width: Option<usize> = None;
-    let mut long = false;
+    let mut view: Option<tui::ViewMode> = None;
     let mut reverse = false;
     let mut dirs_first = false;
     let mut sort_mode = 0u8; // 0 name, 1 ext, 2 size, 3 time
@@ -219,7 +220,7 @@ command-line flags win.
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
-            "--long" => long = true,
+            "--long" => view = Some(tui::ViewMode::Long),
             "--reverse" => reverse = true,
             "--dirs-first" => dirs_first = true,
             "--icons" => icons = true,
@@ -238,7 +239,10 @@ command-line flags win.
             }
             "--view" => {
                 i += 1;
-                long = args.get(i).map(|s| s.as_str() == "long").unwrap_or(false);
+                match args.get(i).and_then(|s| tui::ViewMode::parse(s)) {
+                    Some(v) => view = Some(v),
+                    None => eprintln!("lusty: --view takes list, grid or long"),
+                }
             }
             "--depth" => {
                 i += 1;
@@ -277,14 +281,18 @@ command-line flags win.
         follow_mounts: false,
         show_dots: false,
     };
-    if !long {
-        long = std::env::var("LUSTY_VIEW")
-            .map(|v| v == "long")
-            .unwrap_or(false);
+    // CLI flags win over the environment; grid is the default (the adaptive
+    // multi-column layout the picker always had).
+    if view.is_none() {
+        view = std::env::var("LUSTY_VIEW")
+            .ok()
+            .and_then(|v| tui::ViewMode::parse(&v));
     }
     let mut app = tui::App::new(root, opts);
     app.set_ui(rows, width);
-    app.set_long(long);
+    if let Some(v) = view {
+        app.set_view(v);
+    }
     app.set_sort(reverse, dirs_first);
     app.set_sort_mode(sort_mode);
     if icons {
