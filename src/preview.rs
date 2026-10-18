@@ -17,6 +17,21 @@ use std::process::Command;
 /// Command output (git diff, man) is capped at this many bytes.
 const MAX_CMD_BYTES: usize = 512 * 1024;
 
+/// Truncate to at most `max` bytes without splitting a UTF-8 character.
+/// `String::truncate` panics when `max` is not a char boundary, and command
+/// output (a diff or man page with non-ASCII text) can always cut a multi-byte
+/// character exactly there.
+fn truncate_on_char_boundary(s: &mut String, max: usize) {
+    if s.len() <= max {
+        return;
+    }
+    let mut end = max;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    s.truncate(end);
+}
+
 fn max_image_bytes() -> u64 {
     std::env::var("LUSTY_PREVIEW_MAX_BYTES")
         .ok()
@@ -219,9 +234,7 @@ fn git_diff_lines(path: &Path, repo: &Path) -> Vec<String> {
     match out {
         Ok(o) if o.status.success() => {
             let mut text = String::from_utf8_lossy(&o.stdout).into_owned();
-            if text.len() > MAX_CMD_BYTES {
-                text.truncate(MAX_CMD_BYTES);
-            }
+            truncate_on_char_boundary(&mut text, MAX_CMD_BYTES);
             if text.trim().is_empty() {
                 text = "(no unstaged changes)".to_string();
             }
@@ -242,9 +255,7 @@ fn man_lines(path: &Path) -> Vec<String> {
     match out {
         Ok(o) if o.status.success() => {
             let mut text = String::from_utf8_lossy(&o.stdout).into_owned();
-            if text.len() > MAX_CMD_BYTES {
-                text.truncate(MAX_CMD_BYTES);
-            }
+            truncate_on_char_boundary(&mut text, MAX_CMD_BYTES);
             // Collapse groff overstrike bold/underline (X BS X) so the
             // pane stays readable: drop the backspace and keep one copy.
             let mut clean = String::with_capacity(text.len());
@@ -283,6 +294,18 @@ mod tests {
         assert!(is_image(Path::new("img.jpeg")));
         assert!(!is_image(Path::new("note.md")));
         assert!(!is_image(Path::new("noext")));
+    }
+
+    #[test]
+    fn truncation_keeps_char_boundaries() {
+        // The cap can fall inside a multi-byte char; truncation must back off
+        // to the boundary instead of panicking (String::truncate would).
+        let mut cut = "a".repeat(10) + "€" + "tail";
+        truncate_on_char_boundary(&mut cut, 11);
+        assert_eq!(cut, "a".repeat(10));
+        let mut untouched = "ok".to_string();
+        truncate_on_char_boundary(&mut untouched, 8);
+        assert_eq!(untouched, "ok");
     }
 
     #[test]
