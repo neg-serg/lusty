@@ -35,12 +35,16 @@ fzf/telescope/skim, (3) добавить графический фронтенд
 
 ## Фаза 2 — нормальные режимы TUI
 
-- Ввести `ViewMode { List, Grid, Long }` + CLI `--view list|grid|long`,
-  цикл по клавише (расширить текущий `C-l`), `LUSTY_VIEW` как дефолт.
-- Grid: адаптивные колонки, column-major (фаза 0), подсветка текущей строки
-  целиком (как fzf `--pointer`/highlight), заголовок с `matched/total`.
-- Long: маска колонок уже есть (`perm,user,size,time`), добавить заголовок
-  и выравнивание; проверить на non-UTF8 (сделано в `meta_line`).
+- Сделано: `ViewMode { List, Grid, Long }`, `--view list|grid|long` +
+  `LUSTY_VIEW` (CLI важнее env), `C-l` цикл по трём режимам, `--long` —
+  алиас `--view long`; дефолт `Grid` = прежняя адаптивная сетка.
+  Раскладку задаёт `view_cols` (list/long — одна колонка, grid —
+  адаптивные), `draw` рендерит в любой `Write`, поэтому режимы покрыты
+  тестами кадра: list — одна запись в строке, grid — ≥2 колонки, long —
+  поле прав перед именем.
+- Осталось по режимам: подсветка текущей строки целиком в grid (как fzf
+  `--pointer`/highlight), заголовок со счётчиком `matched/total`,
+  заголовок и выравнивание колонок в long.
 - Preview: параметры в духе skim — позиция `right|left|up|down`,
   размер в `%`, `wrap`, `cycle`, `hidden`; env `LUSTY_PREVIEW_*`;
   асинхронный рендер уже есть, добавить защиту от шторма процессов
