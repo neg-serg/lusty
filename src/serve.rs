@@ -4,7 +4,8 @@
 //! per line, so the nvim side can render results in a normal floating window
 //! (no terminal buffer involved):
 //!
-//!   E                     -> "C <total> <depth> <root>"  (ready)
+//!   on start               -> "C <total> <depth> <root>" (ready banner),
+//!                             then "X preview" (capability; see below)
 //!   Q <from> <to> <query> [sort] [dirs] [rev]
 //!                            -> "N <matched>", "W <maxw>", then
 //!                               "R <i> <kind> <label>\t<path>" rows for
@@ -168,6 +169,10 @@ pub fn serve(
     // Frecency journal from the nvim client (absolute path bytes -> score),
     // sent as fire-and-forget `F` records before the first `Q`.
     let mut frec: HashMap<Vec<u8>, f64> = HashMap::new();
+    // Bumped on every recorded `F`; the memo below re-ranks when it changed.
+    // Counting the map length was not enough: re-recording a known path with a
+    // new score keeps the length and would leave the ranking stale.
+    let mut frec_rev = 0u64;
 
     let stdin = io::stdin();
     let stdout = io::stdout();
@@ -181,9 +186,12 @@ pub fn serve(
     writeln!(out, "X preview")?;
     out.flush()?;
     if let Ok(db) = std::env::var("LUSTY_SERVE_DEBUG") {
-        let mut f = std::fs::OpenOptions::new().append(true).open(&db).unwrap();
-        use std::io::Write as _;
-        let _ = f.write_all(b" C-printed\n");
+        // Debug-only breadcrumb: a missing/unwritable file must not affect the
+        // protocol, so failures are ignored rather than unwrapped.
+        if let Ok(mut f) = std::fs::OpenOptions::new().append(true).open(&db) {
+            use std::io::Write as _;
+            let _ = f.write_all(b" C-printed\n");
+        }
     }
 
     // Memoize the most recent query: navigation and redraws resend the
@@ -199,8 +207,8 @@ pub fn serve(
     let mut memo_ranked: Vec<usize> = Vec::new();
     let mut memo_maxw: usize = 0;
     // Frecency records can arrive after a Q (the client sends them at startup,
-    // but the order is not guaranteed); re-rank when the map grew.
-    let mut memo_frec = 0usize;
+    // but the order is not guaranteed); re-rank when a record landed.
+    let mut memo_frec_rev = 0u64;
     for line in stdin.lock().lines() {
         let line = match line {
             Ok(l) => l,
@@ -218,6 +226,7 @@ pub fn serve(
                 if score > 0.0 {
                     if let Some(p) = parts.get(2) {
                         frec.insert(unescape_bytes(p), score);
+                        frec_rev += 1;
                     }
                 }
             }
@@ -237,7 +246,7 @@ pub fn serve(
                     || sort != memo_sort
                     || dirs_first != memo_dirs
                     || reverse != memo_rev
-                    || frec.len() != memo_frec
+                    || frec_rev != memo_frec_rev
                 {
                     memo_hit = true;
                     if sort != memo_sort || dirs_first != memo_dirs || reverse != memo_rev {
@@ -276,13 +285,17 @@ pub fn serve(
                     memo_q = query.clone();
                     memo_ranked = ranked;
                     memo_maxw = maxw;
-                    memo_frec = frec.len();
+                    memo_frec_rev = frec_rev;
                 }
                 let ranked = &memo_ranked;
                 writeln!(out, "N {}", ranked.len())?;
                 writeln!(out, "W {}", memo_maxw)?;
-                let end = to.min(ranked.len());
-                for &i in &ranked[from.min(ranked.len())..end] {
+                // from/to arrive independently from the client: clamp them
+                // against each other as well, so a reversed or stale range is
+                // an empty page instead of a slice-index panic.
+                let start = from.min(ranked.len());
+                let end = to.clamp(start, ranked.len());
+                for &i in &ranked[start..end] {
                     let e = &entries[i];
                     let kind = match e.kind {
                         FileKind::Dir => 'd',

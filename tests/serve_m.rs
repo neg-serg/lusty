@@ -271,3 +271,32 @@ fn serve_q_sort_cycles_and_resets() {
     assert!(child.wait().unwrap().success());
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn serve_q_reversed_range_is_empty_not_a_panic() {
+    // A stale or buggy client can send from > to; the backend must answer an
+    // empty page (N/W/E) and stay alive instead of panicking on the slice.
+    let dir = root_dir();
+    let (mut child, mut stdin, mut lines) = spawn(&dir);
+    let _ = read_banner(&mut lines);
+
+    ask(&mut stdin, "Q\t1\t0\t\t0");
+    let resp = until_e(&mut lines);
+    assert_eq!(resp.first().map(String::as_str), Some("N 2"), "{resp:?}");
+    assert!(
+        !resp.iter().any(|l| l.starts_with("R ")),
+        "reversed range yields no rows: {resp:?}"
+    );
+
+    // The process must still serve the next request.
+    ask(&mut stdin, "Q\t0\t50\t\t0");
+    let resp = until_e(&mut lines);
+    assert!(
+        resp.iter().any(|l| l.starts_with("R ")),
+        "server survives the reversed range: {resp:?}"
+    );
+
+    drop(stdin);
+    assert!(child.wait().unwrap().success());
+    let _ = std::fs::remove_dir_all(&dir);
+}
