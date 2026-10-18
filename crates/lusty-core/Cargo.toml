@@ -1,0 +1,11 @@
+[package]
+name = "lusty-core"
+version = "0.1.0"
+edition = "2021"
+description = "Listing, cache, ranking and preview stack shared by the lusty front-ends"
+license = "MIT"
+
+[dependencies]
+lusty-fuzzy = { path = "../lusty-fuzzy" }
+rayon = "1"
+libc = "0.2"

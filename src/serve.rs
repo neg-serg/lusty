@@ -48,18 +48,18 @@ use std::io::{self, BufRead, Write};
 use std::os::unix::ffi::OsStrExt;
 use std::path::PathBuf;
 
-use crate::cache;
-use crate::listing::{Entry, FileKind, Options};
-use crate::rank;
+use lusty_core::cache;
+use lusty_core::listing::{Entry, FileKind, Options};
+use lusty_core::rank;
 
 /// Re-sort the listing by an eza-style key. The sort helpers expect the
 /// canonical (depth, name) order and sort per depth group, so the caller
 /// restores that order from the base snapshot before every change.
 fn apply_sort(entries: &mut Vec<Entry>, root: &std::path::Path, sort: u8) {
     match sort {
-        1 => crate::listing::sort_by_ext(entries),
-        2 => crate::listing::sort_by_meta(root, entries, false),
-        3 => crate::listing::sort_by_meta(root, entries, true),
+        1 => lusty_core::listing::sort_by_ext(entries),
+        2 => lusty_core::listing::sort_by_meta(root, entries, false),
+        3 => lusty_core::listing::sort_by_meta(root, entries, true),
         _ => {}
     }
 }
@@ -262,7 +262,7 @@ pub fn serve(
                             if base.is_none() {
                                 base = Some(entries.clone());
                             }
-                            crate::listing::reorder(&mut entries, dirs_first, reverse);
+                            lusty_core::listing::reorder(&mut entries, dirs_first, reverse);
                         }
                         memo_sort = sort;
                         memo_dirs = dirs_first;
@@ -337,8 +337,8 @@ pub fn serve(
                     };
                     if i < entries.len() {
                         let e = &entries[i];
-                        let meta =
-                            crate::listing::meta_line(&e.path(&root), mask).unwrap_or_default();
+                        let meta = lusty_core::listing::meta_line(&e.path(&root), mask)
+                            .unwrap_or_default();
                         writeln!(out, "K {} {}", i, meta)?;
                     }
                 }
@@ -366,9 +366,9 @@ pub fn serve(
                     .clamp(1, 200);
                 let pane = if i < entries.len() {
                     let e = &entries[i];
-                    crate::preview::render(&e.path(&root), e.kind == FileKind::Dir, w, h)
+                    lusty_core::preview::render(&e.path(&root), e.kind == FileKind::Dir, w, h)
                 } else {
-                    crate::preview::Pane {
+                    lusty_core::preview::Pane {
                         dim: true,
                         lines: Vec::new(),
                     }

@@ -13,12 +13,12 @@ use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
 use crossterm::execute;
 use crossterm::terminal::{self};
 
-use crate::cache;
-use crate::colors::{self, Colors};
-use crate::listing::{Entry, FileKind, Options};
+use lusty_core::cache;
+use lusty_core::colors::{self, Colors};
+use lusty_core::listing::{Entry, FileKind, Options};
 // The RU→EN table lives in the shared crate now (mirrored by the Lua front-end
 // through `lusty --ru-map`); re-exported so call sites keep their names.
-use crate::rank;
+use lusty_core::rank;
 pub use lusty_fuzzy::layout::{normalize_query_char, ru_to_en};
 
 /// Kitty graphics protocol support: `LUSTY_KITTY` overrides (`0` disables),
@@ -109,7 +109,7 @@ pub struct App {
     pane_kind: u8,            // 0 off, 1 dim text (git/man/info), 2 chafa art
     pane: Vec<String>,        // pre-clipped pane rows (preview_w wide)
     pane_key: Option<String>, // cache key: path + size + geometry
-    pane_rx: Option<std::sync::mpsc::Receiver<(String, crate::preview::Pane, Option<String>)>>, // in-flight render
+    pane_rx: Option<std::sync::mpsc::Receiver<(String, lusty_core::preview::Pane, Option<String>)>>, // in-flight render
     pane_kitty: Option<String>, // kitty graphics sequence for an image pane
     kitty: bool,                // terminal speaks the kitty graphics protocol
     kitty_drawn: bool,          // an image is currently placed
@@ -239,10 +239,10 @@ impl App {
             };
             let mut listed = cache::cached_list(&self.root, &opts);
             match self.sort_mode {
-                1 => crate::listing::sort_by_ext(&mut listed),
-                2 => crate::listing::sort_by_meta(&self.root, &mut listed, false),
-                3 => crate::listing::sort_by_meta(&self.root, &mut listed, true),
-                _ => crate::listing::reorder(&mut listed, self.dirs_first, self.reverse),
+                1 => lusty_core::listing::sort_by_ext(&mut listed),
+                2 => lusty_core::listing::sort_by_meta(&self.root, &mut listed, false),
+                3 => lusty_core::listing::sort_by_meta(&self.root, &mut listed, true),
+                _ => lusty_core::listing::reorder(&mut listed, self.dirs_first, self.reverse),
             }
             // Cache the widest label once per listing: max_cols/col_width ask
             // for it on every redraw, and a full scan per keystroke on a
@@ -658,9 +658,9 @@ impl App {
         let (tx, rx) = std::sync::mpsc::channel();
         let worker_key = key.clone();
         std::thread::spawn(move || {
-            let pane = crate::preview::render(&path, is_dir, pw, rows);
-            let kitty = if use_kitty && crate::preview::is_image(&path) {
-                crate::preview::kitty_image(&path, pw, rows)
+            let pane = lusty_core::preview::render(&path, is_dir, pw, rows);
+            let kitty = if use_kitty && lusty_core::preview::is_image(&path) {
+                lusty_core::preview::kitty_image(&path, pw, rows)
             } else {
                 None
             };
@@ -703,7 +703,7 @@ impl App {
     /// Format and clip a rendered pane into the row buffer. With a kitty
     /// graphics sequence the pane is blanked instead: the image (drawn above
     /// the cell background, below text) shows through.
-    fn install_pane(&mut self, pane: &crate::preview::Pane, kitty: Option<String>) {
+    fn install_pane(&mut self, pane: &lusty_core::preview::Pane, kitty: Option<String>) {
         let rows = self.list_rows();
         let pw = self.preview_w;
         self.pane_kitty = kitty;
@@ -958,7 +958,7 @@ impl App {
                         let e = self.listing()[i].clone();
                         if self.long {
                             if let Some(m) =
-                                crate::listing::meta_line(&e.path(&root_path), self.cols_mask)
+                                lusty_core::listing::meta_line(&e.path(&root_path), self.cols_mask)
                             {
                                 cell.push_str(&format!("{esc}[38;2;108;126;150m{m}"));
                                 cell.push_str(&revert);
@@ -1361,10 +1361,10 @@ pub const ICON_EXTS: &[(&str, &str)] = &[
 ];
 
 /// Nerd-font glyph for an entry; falls back to the generic file icon.
-fn icon_for(e: &crate::listing::Entry) -> &'static str {
+fn icon_for(e: &lusty_core::listing::Entry) -> &'static str {
     match e.kind {
-        crate::listing::FileKind::Dir => ICON_DIR,
-        crate::listing::FileKind::Link => ICON_LINK,
+        lusty_core::listing::FileKind::Dir => ICON_DIR,
+        lusty_core::listing::FileKind::Link => ICON_LINK,
         _ => {
             let low = e.basename().to_ascii_lowercase();
             ICON_EXTS
