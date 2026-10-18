@@ -1,4 +1,4 @@
-//! On-disk listing cache for big roots (binary format, "LST4" v1).
+//! On-disk listing cache for big roots (binary format, "LST5" v1).
 //!
 //! A listing is a pure function of the tree shape: entry names, kinds and
 //! depths. Content edits never change it, only adds/removes/renames do, and
@@ -8,7 +8,7 @@
 //! a single stat) instead of re-reading every entry.
 //!
 //! Layout (all integers little-endian):
-//!   magic "LSTC" | depth u32 | dots u8 | follow u8
+//!   magic "LST5" | depth u32 | dots u8 | follow u8
 //!   mounts:  u32 count, each len u32 + bytes
 //!   dirs:    u32 count, each label-len u32 + label bytes | mtime i64 | count u64
 //!   entries: u32 count, each kind u8 | depth u32 | name0 u8 | rel-len
@@ -21,6 +21,7 @@
 //! cursor, which keeps warm loads cheap.
 
 use std::fs;
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
 use crate::listing::{self, Entry, FileKind, Options};
@@ -30,7 +31,7 @@ const MAX_WATCH_DIRS: usize = 4096;
 /// Only bother caching trees with at least this many entries.
 const MIN_ENTRIES: usize = 16;
 
-const MAGIC: &[u8] = b"LST4";
+const MAGIC: &[u8] = b"LST5";
 
 fn cache_enabled() -> bool {
     match std::env::var("LUSTY_CACHE") {
@@ -109,17 +110,20 @@ fn mtime_len(p: &Path) -> Option<(i128, u64)> {
     Some((d.as_nanos() as i128, md.len()))
 }
 
-/// Directories whose contents affect the listing (label, mtime, count): the
-/// root itself (label "") plus every listed dir that was descended into.
-fn watch_dirs(root: &Path, entries: &[Entry], opts: &Options) -> Vec<(String, i128, u64)> {
+/// Directories whose contents affect the listing (raw label bytes, mtime,
+/// count): the root itself (empty label) plus every listed dir that was
+/// descended into. Labels keep the raw Unix bytes, exactly like entry paths:
+/// a lossy label would validate a different (replacement-char) path and make
+/// the cache miss on every load for non-UTF8 directory names.
+fn watch_dirs(root: &Path, entries: &[Entry], opts: &Options) -> Vec<(Vec<u8>, i128, u64)> {
     let mut out = Vec::new();
     if let Some((m, l)) = mtime_len(root) {
-        out.push((String::new(), m, l));
+        out.push((Vec::new(), m, l));
     }
     for e in entries {
         if e.kind == FileKind::Dir && (e.depth as usize) < opts.depth {
             if let Some((m, l)) = mtime_len(&e.path(root)) {
-                out.push((e.label.clone(), m, l));
+                out.push((e.rel_bytes.clone(), m, l));
             }
         }
     }
@@ -153,7 +157,7 @@ fn store(
     path: &Path,
     opts: &Options,
     entries: &[Entry],
-    dirs: &[(String, i128, u64)],
+    dirs: &[(Vec<u8>, i128, u64)],
     mounts: &[String],
 ) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
@@ -170,7 +174,7 @@ fn store(
     }
     put_u32(&mut w, dirs.len() as u32);
     for (label, m, l) in dirs {
-        put_str(&mut w, label);
+        put_bytes(&mut w, label);
         put_i64(&mut w, *m as i64);
         put_u64(&mut w, *l);
     }
@@ -270,13 +274,15 @@ fn try_load(path: &Path, root: &Path, opts: &Options) -> Option<Vec<Entry>> {
     }
     let dn = c.u32()? as usize;
     for _ in 0..dn {
-        let label = c.str()?;
+        let label = c.bytes()?;
         let m = c.i64()? as i128;
         let l = c.u64()?;
+        // Rebuild the watched path from the raw bytes; a lossy label would
+        // stat a replacement-char name and never validate (permanent miss).
         let p = if label.is_empty() {
             root.to_path_buf()
         } else {
-            root.join(&label)
+            root.join(std::ffi::OsStr::from_bytes(&label))
         };
         if mtime_len(&p) != Some((m, l)) {
             return None;
@@ -366,5 +372,46 @@ mod tests {
         assert_eq!(fourth.len(), first.len(), "cache invalidated after removal");
         let _ = fs::remove_dir_all(&dir);
         let _ = fs::remove_dir_all(&cache_dir);
+    }
+
+    #[test]
+    fn non_utf8_dir_labels_validate() {
+        use std::os::unix::ffi::OsStrExt;
+        let root = std::env::temp_dir().join("lusty_native_cache_nu_root");
+        let store_dir = std::env::temp_dir().join("lusty_native_cache_nu_store");
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&store_dir);
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(&store_dir).unwrap();
+        let sub = root.join(std::ffi::OsStr::from_bytes(b"sub\xe9"));
+        fs::create_dir_all(&sub).unwrap();
+        for i in 0..20 {
+            fs::write(sub.join(format!("f{i:02}.txt")), b"x").unwrap();
+        }
+
+        let opts = Options {
+            depth: 2,
+            skip_dirs: vec![],
+            follow_mounts: false,
+            show_dots: false,
+        };
+        let entries = listing::list(&root, &opts);
+        let dirs = watch_dirs(&root, &entries, &opts);
+        assert!(
+            dirs.iter().any(|(l, _, _)| l.as_slice() == b"sub\xe9"),
+            "raw bytes are stored, not the lossy label"
+        );
+
+        // The cache file lives outside the watched tree so writing it does not
+        // invalidate the very snapshot we are about to validate.
+        let file = store_dir.join("probe.lc");
+        let mounts = current_mounts();
+        store(&file, &opts, &entries, &dirs, &mounts).unwrap();
+        let loaded = try_load(&file, &root, &opts).expect("cache hit for a non-UTF8 dir name");
+        assert_eq!(loaded.len(), entries.len());
+        assert!(loaded.iter().any(|e| e.raw_basename() == b"f19.txt"));
+
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&store_dir);
     }
 }
