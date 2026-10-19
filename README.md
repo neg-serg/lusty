@@ -67,6 +67,11 @@ the rows. The selected cell is highlighted across its whole width, and the
 prompt ends with the search depth and a `matched/total` counter, so a filter
 that hides everything is visible at a glance.
 
+A window with a single entry row (`--rows 4`) becomes a horizontal strip in
+every mode: `list` and `long` drop the meta columns and the header there
+instead of showing one result at a time. The meta columns return with two
+entry rows, the header with three.
+
 ## serve protocol
 
 Plain lines on stdin/stdout, one request per line:
