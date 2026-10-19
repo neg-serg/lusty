@@ -5,6 +5,7 @@
 //! headless line-protocol backend for the nvim float) and the standalone
 //! raw-mode TUI (grid/long views, preview pane, RU/EN layout).
 
+mod contrast;
 mod serve;
 mod tui;
 

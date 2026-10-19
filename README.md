@@ -78,6 +78,18 @@ every mode: `list` and `long` drop the meta columns and the header there
 instead of showing one result at a time. The meta columns return with two
 entry rows, the header with three.
 
+### Colour invariants
+
+Every colour the popup paints is held to a computed WCAG 2.1 floor
+(`src/contrast.rs`, asserted in `contrast_invariants`): secondary text (meta,
+header, counter) ≥ 4.5:1 on the popup, the selection bar ≥ 3:1 against it with
+its text ≥ 4.5:1 on the bar, the `+` mark glyph ≥ 4.5:1 on the mark tint, and
+the frame line at a 1.5:1 decorative floor. The cursor carries bold (or
+underline/reverse) and the mark carries a glyph, so neither state is encoded in
+colour alone. A `theme.toml` field that breaks its floor falls back to the
+default value, so a bad theme degrades to readable colours instead of an
+unreadable frame.
+
 ## serve protocol
 
 Plain lines on stdin/stdout, one request per line:
