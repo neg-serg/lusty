@@ -114,6 +114,12 @@ Paths travel as raw Unix bytes: a name that is not valid UTF-8 is still
 openable (the label, used for display only, is the lossy form). `F` records use
 the same escaping in the client-to-server direction.
 
+Labels are display text, so the remaining control bytes in them are replaced by
+`?` before they leave the backend (and before `--list` prints them): a file
+named `esc_ESC[2J_name` must not be able to drive the terminal or the client
+buffer. Paths keep their bytes — the client opens those, it does not paint
+them.
+
 With at least one `F` record the empty query orders by (depth, frecency score,
 canonical index): the shallower depth contract stays, and inside a depth the
 most frequent/recent paths lead.
