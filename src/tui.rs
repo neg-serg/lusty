@@ -611,15 +611,37 @@ impl App {
         self.preview_w = pw.clamp(20, self.box_w.saturating_sub(21).max(20));
     }
 
+    /// Rows of the entry area inside the borders, prompt excluded.
+    fn content_rows(&self) -> usize {
+        self.box_h.saturating_sub(3).max(1)
+    }
+
+    /// The long view only earns its meta columns when at least two entry rows
+    /// stay visible; a one-row window is a strip instead (see `view_cols`).
+    fn long_meta(&self) -> bool {
+        self.view == ViewMode::Long && self.cols_mask != 0
+    }
+
+    /// The header costs a row, so it only appears when two rows stay for the
+    /// entries themselves — otherwise a one-row window would show the header
+    /// and no results at all.
+    fn shows_long_header(&self) -> bool {
+        self.long_meta() && self.content_rows() >= 3
+    }
+
+    /// Meta fields are printed per entry while at least two rows fit; the
+    /// single-row strip shows names only, or a `meta_line` would eat the cell.
+    fn shows_meta(&self) -> bool {
+        self.long_meta() && self.list_rows() >= 2
+    }
+
     fn list_rows(&self) -> usize {
-        // Content rows inside the borders minus the prompt line at the bottom
-        // (box_h includes the two border rows) and, in the long view, the
-        // column header that sits above the entries.
-        let fixed = match self.view {
-            ViewMode::Long if self.cols_mask != 0 => 4,
-            _ => 3,
-        };
-        self.box_h.saturating_sub(fixed).max(1)
+        let content = self.content_rows();
+        if self.shows_long_header() {
+            content - 1
+        } else {
+            content
+        }
     }
 
     /// Width of the entry-grid area: the whole box, or the left part when
@@ -655,6 +677,10 @@ impl App {
     fn view_cols(&mut self) -> usize {
         match self.view {
             ViewMode::Grid => self.max_cols(),
+            // A single entry row cannot stack anything: pack a horizontal
+            // strip, otherwise the window shows the cursor entry and hides
+            // every other result behind it.
+            _ if self.list_rows() == 1 => self.max_cols(),
             ViewMode::List | ViewMode::Long => 1,
         }
     }
@@ -1005,11 +1031,9 @@ impl App {
         // The grid adapts to the popup; the list and long views use one
         // full-width column.
         let cols = self.view_cols();
-        let col_w = if self.view == ViewMode::Grid {
-            self.col_width()
-        } else {
-            lw
-        };
+        // Multi-column layouts size every column; a single column spans the
+        // whole list area.
+        let col_w = if cols > 1 { self.col_width() } else { lw };
         let bg = FRAME_BG;
         let border = FRAME_BORDER;
         let revert = format!("{esc}[22;23;24;39;{bg}m"); // default fg on popup bg
@@ -1027,7 +1051,7 @@ impl App {
         // Content rows: entry grid on top, prompt as the bottom line. The long
         // view spends its first content row on a column header that uses the
         // same field widths as the rows, so the entries start one row lower.
-        let long_header = if self.view == ViewMode::Long {
+        let long_header = if self.shows_long_header() {
             lusty_core::listing::meta_header(self.cols_mask)
         } else {
             None
@@ -1059,7 +1083,7 @@ impl App {
                         if pos < self.ranked.len() {
                             let i = self.ranked[pos];
                             let e = self.listing()[i].clone();
-                            if self.view == ViewMode::Long {
+                            if self.shows_meta() {
                                 if let Some(m) = lusty_core::listing::meta_line(
                                     &e.path(&root_path),
                                     self.cols_mask,
@@ -2027,6 +2051,63 @@ mod view_test {
             "long rows start with a perm field: {hit:?}"
         );
         assert_eq!(hit.matches(".txt").count(), 1, "one entry per line");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_one_row_window_shows_several_results_in_every_mode() {
+        for mode in [ViewMode::List, ViewMode::Grid, ViewMode::Long] {
+            let tag = format!("strip_{mode:?}");
+            let (mut app, dir) = layout_fixture(&tag);
+            app.view = mode;
+            app.box_h = 4; // exactly one entry row
+            assert_eq!(app.list_rows(), 1, "{mode:?} has a single entry row");
+            // Render first: the ranking (and the widest label) only exist
+            // after a draw, and both feed the column math.
+            let rows = frame_rows(&mut app);
+            assert!(
+                app.view_cols() > 1,
+                "{mode:?} packs the strip instead of showing one result"
+            );
+            let entry_row = rows
+                .iter()
+                .find(|r| r.contains(".txt"))
+                .unwrap_or_else(|| panic!("{mode:?} shows no entry: {rows:?}"));
+            assert!(
+                entry_row.matches(".txt").count() >= 2,
+                "{mode:?} shows several results in its single row: {entry_row:?}"
+            );
+            if mode == ViewMode::Long {
+                assert!(
+                    !rows.iter().any(|r| r.contains("PERM")),
+                    "no header in a one-row window: {rows:?}"
+                );
+                assert!(
+                    !entry_row.contains("-rw"),
+                    "no meta columns in the strip: {entry_row:?}"
+                );
+            }
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    #[test]
+    fn long_keeps_meta_without_header_when_two_rows_fit() {
+        let (mut app, dir) = layout_fixture("two_rows");
+        app.view = ViewMode::Long;
+        app.box_h = 5; // two entry rows, no space for the header
+        assert_eq!(app.list_rows(), 2);
+        assert!(app.shows_meta(), "meta columns fit in two rows");
+        let rows = frame_rows(&mut app);
+        assert!(
+            !rows.iter().any(|r| r.contains("PERM")),
+            "header needs two entry rows: {rows:?}"
+        );
+        assert_eq!(
+            rows.iter().filter(|r| r.contains("-rw")).count(),
+            2,
+            "both rows keep their meta: {rows:?}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
