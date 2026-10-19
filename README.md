@@ -62,7 +62,9 @@ depth (1..6). The last typed query is restored on the next run.
 `list` is one entry per row, `grid` (the default) packs as many adaptive
 columns as the popup width allows — filled top-to-bottom, columns left to
 right — and `long` puts the eza `-l` style mode/size/date in front of each
-name.
+name. The selected cell is highlighted across its whole width, and the prompt
+ends with the search depth and a `matched/total` counter, so a filter that
+hides everything is visible at a glance.
 
 ## serve protocol
 

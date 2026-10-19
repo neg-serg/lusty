@@ -133,6 +133,7 @@ pub struct App {
     sort_mode: u8,           // 0 name, 1 ext, 2 size, 3 time
     cols_mask: u8,           // long view fields: 1 perm, 2 user, 4 size, 8 time
     maxw: usize,             // widest label (chars) in the current listing
+    total: usize,            // entries in the listing the current query filters
     palette: Colors,
     preview_on: bool,         // right preview pane (C-Space / Shift+P toggles)
     preview_w: usize,         // pane width in columns
@@ -175,6 +176,7 @@ impl App {
             sort_mode: 0,
             cols_mask: 15,
             maxw: 0,
+            total: 0,
             palette,
             preview_on: false,
             preview_w: 40,
@@ -307,7 +309,9 @@ impl App {
         }
         let query = self.query.clone();
         let entries = self.listing();
+        let total = entries.len();
         self.ranked = rank::rank_indices(entries, &query);
+        self.total = total;
         self.needs_rank = false;
         if self.selected >= self.ranked.len() && !self.ranked.is_empty() {
             self.selected = self.ranked.len() - 1;
@@ -1047,9 +1051,12 @@ impl App {
                         if e.kind == FileKind::Dir && !self.icons {
                             cell.push('/');
                         }
-                        cell.push_str(&revert);
                     }
+                    // Pad first and reset after: the selected cell keeps its
+                    // background across the whole column instead of stopping
+                    // at the end of the name.
                     ansi_pad(&mut cell, col_w);
+                    cell.push_str(&revert);
                     line.push_str(&cell);
                     if c + 1 < cols {
                         line.push_str("  ");
@@ -1186,9 +1193,15 @@ impl App {
         push_painted(&current, "38;2;149;167;188", &mut out);
         push_painted(" \u{f105} ", "38;2;0;95;175", &mut out);
         push_painted(&self.query, "1;38;2;255;255;255", &mut out);
-        // Search depth (C-d cycles it), dimmed like the border.
+        // Search depth (C-d cycles it) and the matched/total counter, dimmed
+        // like the border.
         push_painted(
-            &format!("  d{}", self.opts.depth),
+            &format!(
+                "  d{}  {}/{}",
+                self.opts.depth,
+                self.ranked.len(),
+                self.total
+            ),
             "38;2;108;126;150",
             &mut out,
         );
@@ -1824,39 +1837,69 @@ mod view_test {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Split a rendered frame into visual rows: the frame is one string and
-    /// every row starts with a `ESC[<row>;1H` cursor move, everything else is
-    /// SGR styling or an erase.
-    fn frame_rows(app: &mut App) -> Vec<String> {
+    /// Escapes of a rendered frame, minus the `ESC[<row>;1H` cursor moves:
+    /// the result is one raw string per visual row, styling intact.
+    fn frame_parts(app: &mut App) -> Vec<String> {
         let mut buf: Vec<u8> = Vec::new();
         app.draw(&mut buf).expect("render into a buffer");
         let text = String::from_utf8_lossy(&buf);
+        let esc = char::from_u32(0x1b).unwrap();
         let mut rows: Vec<String> = Vec::new();
         let mut cur = String::new();
         let mut chars = text.chars();
         while let Some(ch) = chars.next() {
-            if ch != char::from_u32(0x1b).unwrap() {
+            if ch != esc {
                 cur.push(ch);
                 continue;
             }
-            if chars.next() != Some('[') {
-                continue;
+            let mut seq = String::from(esc);
+            if let Some(n) = chars.next() {
+                seq.push(n);
             }
             let mut final_byte = None;
             for n in chars.by_ref() {
+                seq.push(n);
                 if n.is_ascii_alphabetic() || n == '~' {
                     final_byte = Some(n);
                     break;
                 }
             }
-            if final_byte == Some('H') && !cur.is_empty() {
-                rows.push(std::mem::take(&mut cur));
+            if final_byte == Some('H') {
+                if !cur.is_empty() {
+                    rows.push(std::mem::take(&mut cur));
+                }
+            } else {
+                cur.push_str(&seq);
             }
         }
         if !cur.is_empty() {
             rows.push(cur);
         }
         rows
+    }
+
+    /// Frame rows with the styling stripped.
+    fn frame_rows(app: &mut App) -> Vec<String> {
+        frame_parts(app).iter().map(|r| plain(r)).collect()
+    }
+
+    /// Text of `s` with every SGR/erase escape dropped.
+    fn plain(s: &str) -> String {
+        let esc = char::from_u32(0x1b).unwrap();
+        let mut out = String::new();
+        let mut chars = s.chars();
+        while let Some(ch) = chars.next() {
+            if ch != esc {
+                out.push(ch);
+                continue;
+            }
+            for n in chars.by_ref() {
+                if n.is_ascii_alphabetic() || n == '~' {
+                    break;
+                }
+            }
+        }
+        out
     }
 
     /// Fixture with 20 entries. The directory is per test (`tag`): the tests
@@ -1936,6 +1979,52 @@ mod view_test {
             "long rows start with a perm field: {hit:?}"
         );
         assert_eq!(hit.matches(".txt").count(), 1, "one entry per line");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_selected_cell_keeps_its_background_across_the_line() {
+        let (mut app, dir) = layout_fixture("sel");
+        app.view = ViewMode::List;
+        let rows = frame_parts(&mut app);
+        let row = rows
+            .iter()
+            .find(|r| r.contains("f00.txt"))
+            .expect("the selected entry row");
+        let esc = char::from_u32(0x1b).unwrap();
+        let start = row
+            .find(&format!("{esc}[{}m", sel_style()))
+            .expect("selection style on the selected row");
+        let rest = &row[start..];
+        let reset = rest
+            .find(&format!("{esc}[22;23;24;39;"))
+            .expect("style reset after the selection");
+        let span = plain(&rest[..reset]);
+        assert_eq!(
+            str_width(&span),
+            app.content_w(),
+            "the highlight fills the line instead of stopping at the name: {span:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn prompt_counts_matched_over_total() {
+        let (mut app, dir) = layout_fixture("count");
+        // Empty query: everything matches the listing itself.
+        let rows = frame_rows(&mut app);
+        assert!(
+            rows.iter().any(|r| r.contains("20/20")),
+            "prompt shows matched/total: {rows:?}"
+        );
+        // Nothing matches, but the total stays the listing size.
+        app.query = "zzzzz".to_string();
+        app.needs_rank = true;
+        let rows = frame_rows(&mut app);
+        assert!(
+            rows.iter().any(|r| r.contains("0/20")),
+            "prompt keeps the total while filtering: {rows:?}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
