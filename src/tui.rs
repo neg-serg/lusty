@@ -612,9 +612,14 @@ impl App {
     }
 
     fn list_rows(&self) -> usize {
-        // Content rows inside the borders minus the prompt line at the
-        // bottom (box_h includes the two border rows).
-        self.box_h.saturating_sub(3).max(1)
+        // Content rows inside the borders minus the prompt line at the bottom
+        // (box_h includes the two border rows) and, in the long view, the
+        // column header that sits above the entries.
+        let fixed = match self.view {
+            ViewMode::Long if self.cols_mask != 0 => 4,
+            _ => 3,
+        };
+        self.box_h.saturating_sub(fixed).max(1)
     }
 
     /// Width of the entry-grid area: the whole box, or the left part when
@@ -952,6 +957,37 @@ impl App {
         }
     }
 
+    /// Close one content row: pad the list part to the list width and, with
+    /// the preview pane open, add the divider plus that row's pane cell.
+    fn close_row(
+        &mut self,
+        frame: &mut String,
+        line: &mut String,
+        r: usize,
+        esc: char,
+        lw: usize,
+        w: usize,
+    ) {
+        if self.preview_on {
+            // Left: the entry grid clipped to the list area.
+            ansi_pad(line, lw);
+            frame.push_str(line);
+            line.clear();
+            // Divider between list and preview pane.
+            frame.push_str(&format!("{esc}[{FRAME_BORDER}m"));
+            frame.push('\u{2502}'); // \u2502
+            frame.push_str(&format!("{esc}[0m"));
+            // Right: one pre-rendered pane row.
+            if let Some(prow) = self.pane.get(r) {
+                frame.push_str(prow);
+            }
+            frame.push_str(&format!("{esc}[{FRAME_BG}m"));
+        } else {
+            ansi_pad(line, w);
+            frame.push_str(line);
+        }
+    }
+
     /// Render one frame. Generic over the writer so tests can render into a
     /// buffer and assert the layout without a terminal.
     fn draw<W: Write>(&mut self, out: &mut W) -> io::Result<()> {
@@ -974,8 +1010,8 @@ impl App {
         } else {
             lw
         };
-        let bg = "48;2;0;0;0"; // opaque black popup background
-        let border = "38;2;58;68;84"; // #3a4454 frame, darker than the meta text
+        let bg = FRAME_BG;
+        let border = FRAME_BORDER;
         let revert = format!("{esc}[22;23;24;39;{bg}m"); // default fg on popup bg
         let mut frame = String::with_capacity((w + 64) * (bh + 2));
 
@@ -988,102 +1024,109 @@ impl App {
         }
         frame.push('\u{2510}'); // \u2510
         frame.push_str(&format!("{esc}[0m{esc}[K"));
-        // Content rows: entry grid on top, prompt as the bottom line.
+        // Content rows: entry grid on top, prompt as the bottom line. The long
+        // view spends its first content row on a column header that uses the
+        // same field widths as the rows, so the entries start one row lower.
+        let long_header = if self.view == ViewMode::Long {
+            lusty_core::listing::meta_header(self.cols_mask)
+        } else {
+            None
+        };
         for r in 0..(bh.saturating_sub(2)) {
             frame.push_str(&format!("{esc}[{};1H", top + 2 + r));
             frame.push_str(&format!("{esc}[{bg}m{esc}[{border}m"));
             frame.push('\u{2502}'); // \u2502
             let mut line = String::new();
-            if r < rows {
-                for c in 0..cols {
-                    // Column-major, the same mapping `grid_index` and the
-                    // column navigation use: the grid is `rows` cells tall and
-                    // grows to the right.
-                    let pos = grid_index(self.offset, rows, r, c);
-                    let mut cell = String::new();
-                    if pos < self.ranked.len() {
-                        let i = self.ranked[pos];
-                        let e = self.listing()[i].clone();
-                        if self.view == ViewMode::Long {
-                            if let Some(m) =
-                                lusty_core::listing::meta_line(&e.path(&root_path), self.cols_mask)
-                            {
-                                cell.push_str(&format!("{esc}[38;2;108;126;150m{m}"));
-                                cell.push_str(&revert);
+            let header_row = long_header.is_some() && r == 0;
+            // Entry row for this screen row; None on the header row itself.
+            let entry_row = match long_header {
+                Some(_) => r.checked_sub(1),
+                None => Some(r),
+            };
+            if header_row {
+                let h = long_header.as_deref().unwrap_or_default();
+                line.push_str(&format!("{esc}[38;2;108;126;150m{h} NAME"));
+                line.push_str(&revert);
+                self.close_row(&mut frame, &mut line, r, esc, lw, w);
+            } else if let Some(er) = entry_row {
+                if er < rows {
+                    for c in 0..cols {
+                        // Column-major, the same mapping `grid_index` and the
+                        // column navigation use: the grid is `rows` cells tall
+                        // and grows to the right.
+                        let pos = grid_index(self.offset, rows, er, c);
+                        let mut cell = String::new();
+                        if pos < self.ranked.len() {
+                            let i = self.ranked[pos];
+                            let e = self.listing()[i].clone();
+                            if self.view == ViewMode::Long {
+                                if let Some(m) = lusty_core::listing::meta_line(
+                                    &e.path(&root_path),
+                                    self.cols_mask,
+                                ) {
+                                    cell.push_str(&format!("{esc}[38;2;108;126;150m{m}"));
+                                    cell.push_str(&revert);
+                                    cell.push(' ');
+                                }
+                            }
+                            if pos == self.selected {
+                                cell.push_str(&format!("{esc}[{}m", sel_style()));
+                            } else {
+                                let exec = e.kind == FileKind::File && is_exec(&e.path(&root_path));
+                                if let Some(code) =
+                                    self.palette.code_for(e.basename(), e.kind, exec)
+                                {
+                                    cell.push_str(&format!("{esc}[{code}m"));
+                                }
+                            }
+                            if self.icons {
+                                cell.push_str(icon_for(&e));
                                 cell.push(' ');
                             }
-                        }
-                        if pos == self.selected {
-                            cell.push_str(&format!("{esc}[{}m", sel_style()));
-                        } else {
-                            let exec = e.kind == FileKind::File && is_exec(&e.path(&root_path));
-                            if let Some(code) = self.palette.code_for(e.basename(), e.kind, exec) {
-                                cell.push_str(&format!("{esc}[{code}m"));
+                            // Terminal-safe display copy: a crafted file name
+                            // with ESC must not inject control sequences into
+                            // the frame.
+                            let label = sanitize_display(&e.label);
+                            if let Some((ms, me)) = query_match(&label, &self.query) {
+                                cell.push_str(&label[..ms]);
+                                let mt = theme();
+                                if let Some([r, g, b]) = mt.match_fg {
+                                    cell.push_str(&format!("{esc}[38;2;{r};{g};{b}m"));
+                                }
+                                if mt.match_underline {
+                                    cell.push_str(&format!("{esc}[4m"));
+                                }
+                                cell.push_str(&label[ms..me]);
+                                if mt.match_underline {
+                                    cell.push_str(&format!("{esc}[24m"));
+                                }
+                                if mt.match_fg.is_some() {
+                                    cell.push_str(&format!("{esc}[39m"));
+                                }
+                                cell.push_str(&label[me..]);
+                            } else {
+                                cell.push_str(&label);
+                            }
+                            if e.kind == FileKind::Dir && !self.icons {
+                                cell.push('/');
                             }
                         }
-                        if self.icons {
-                            cell.push_str(icon_for(&e));
-                            cell.push(' ');
-                        }
-                        // Terminal-safe display copy: a crafted file name with
-                        // ESC must not inject control sequences into the frame.
-                        let label = sanitize_display(&e.label);
-                        if let Some((ms, me)) = query_match(&label, &self.query) {
-                            cell.push_str(&label[..ms]);
-                            let mt = theme();
-                            if let Some([r, g, b]) = mt.match_fg {
-                                cell.push_str(&format!("{esc}[38;2;{r};{g};{b}m"));
-                            }
-                            if mt.match_underline {
-                                cell.push_str(&format!("{esc}[4m"));
-                            }
-                            cell.push_str(&label[ms..me]);
-                            if mt.match_underline {
-                                cell.push_str(&format!("{esc}[24m"));
-                            }
-                            if mt.match_fg.is_some() {
-                                cell.push_str(&format!("{esc}[39m"));
-                            }
-                            cell.push_str(&label[me..]);
-                        } else {
-                            cell.push_str(&label);
-                        }
-                        if e.kind == FileKind::Dir && !self.icons {
-                            cell.push('/');
+                        // Pad first and reset after: the selected cell keeps
+                        // its background across the whole column instead of
+                        // stopping at the end of the name.
+                        ansi_pad(&mut cell, col_w);
+                        cell.push_str(&revert);
+                        line.push_str(&cell);
+                        if c + 1 < cols {
+                            line.push_str("  ");
                         }
                     }
-                    // Pad first and reset after: the selected cell keeps its
-                    // background across the whole column instead of stopping
-                    // at the end of the name.
-                    ansi_pad(&mut cell, col_w);
-                    cell.push_str(&revert);
-                    line.push_str(&cell);
-                    if c + 1 < cols {
-                        line.push_str("  ");
-                    }
-                }
-                if self.preview_on {
-                    // Left: the entry grid clipped to the list area.
-                    ansi_pad(&mut line, lw);
-                    frame.push_str(&line);
-                    line.clear();
-                    // Divider between list and preview pane.
-                    frame.push_str(&format!("{esc}[{border}m"));
-                    frame.push('\u{2502}'); // \u2502
-                    frame.push_str(&format!("{esc}[0m"));
-                    // Right: one pre-rendered pane row.
-                    if let Some(prow) = self.pane.get(r) {
-                        frame.push_str(prow);
-                    }
-                    frame.push_str(&format!("{esc}[{bg}m"));
-                } else {
+                    self.close_row(&mut frame, &mut line, r, esc, lw, w);
+                } else if er == rows {
+                    line = self.prompt_line();
                     ansi_pad(&mut line, w);
                     frame.push_str(&line);
                 }
-            } else if r == rows {
-                line = self.prompt_line();
-                ansi_pad(&mut line, w);
-                frame.push_str(&line);
             }
             frame.push_str(&format!("{esc}[{border}m"));
             frame.push('\u{2502}'); // \u2502
@@ -1213,6 +1256,11 @@ impl App {
 
 /// Outer popup height: two border rows plus five entry rows and the prompt.
 const OUTER_ROWS: usize = 8;
+
+/// Frame colors: the opaque popup background and the darker frame/meta border,
+/// shared by the frame itself and the per-row finisher.
+const FRAME_BG: &str = "48;2;0;0;0";
+const FRAME_BORDER: &str = "38;2;58;68;84";
 
 /// Selection theme loaded from the Lusty TOML (env `LUSTY_THEME`; by default
 /// the nvim copy at `$XDG_CONFIG_HOME/nvim/lua/lusty/theme.toml`, then the
@@ -1979,6 +2027,39 @@ mod view_test {
             "long rows start with a perm field: {hit:?}"
         );
         assert_eq!(hit.matches(".txt").count(), 1, "one entry per line");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn long_prints_a_column_header_aligned_with_the_rows() {
+        let (mut app, dir) = layout_fixture("header");
+        app.view = ViewMode::Long;
+        let rows = frame_rows(&mut app);
+        let header = &rows[1]; // rows[0] is the top border
+        assert!(
+            header.contains("PERM") && header.contains("MODIFIED"),
+            "header row: {header:?}"
+        );
+        let entry = rows
+            .iter()
+            .find(|r| r.contains("f00.txt"))
+            .expect("an entry row");
+        assert_eq!(
+            header.find("PERM"),
+            entry.find("-rw"),
+            "the perm column starts where the perms start"
+        );
+        assert_eq!(
+            header.find("NAME"),
+            entry.find("f00.txt"),
+            "the NAME column starts where the labels start"
+        );
+        // The header costs one entry row: box_h = 8 leaves four, not five.
+        assert_eq!(
+            rows.iter().filter(|r| r.contains(".txt")).count(),
+            4,
+            "the header takes one row: {rows:?}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

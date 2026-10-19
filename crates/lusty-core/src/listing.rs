@@ -234,6 +234,29 @@ pub fn meta_line(path: &Path, mask: u8) -> Option<String> {
     Some(parts.join(" "))
 }
 
+/// Column header for `meta_line` with the same mask: every field is padded to
+/// the width `meta_line` prints it with, so the header sits exactly above the
+/// columns in the long view (and both widths stay in one place).
+pub fn meta_header(mask: u8) -> Option<String> {
+    if mask == 0 {
+        return None;
+    }
+    let mut parts: Vec<String> = Vec::new();
+    if mask & 1 != 0 {
+        parts.push(format!("{:10}", "PERM"));
+    }
+    if mask & 2 != 0 {
+        parts.push(format!("{:>5}", "USER"));
+    }
+    if mask & 4 != 0 {
+        parts.push(format!("{:>7}", "SIZE"));
+    }
+    if mask & 8 != 0 {
+        parts.push(format!("{:<16}", "MODIFIED"));
+    }
+    Some(parts.join(" "))
+}
+
 pub struct Options {
     /// 1 = current directory only, 2 = plus one subdirectory level.
     pub depth: usize,
@@ -733,6 +756,27 @@ mod tests {
         }
 
         assert_eq!(line, "2026-09-04 06:40");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn meta_header_lines_up_with_every_mask() {
+        let dir = std::env::temp_dir().join("lusty_native_meta_header_test");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("f.txt");
+        fs::write(&file, b"x").unwrap();
+
+        for mask in 1u8..=15 {
+            let header = meta_header(mask).expect("a header for a non-empty mask");
+            let line = meta_line(&file, mask).expect("a row for a non-empty mask");
+            assert_eq!(
+                header.chars().count(),
+                line.chars().count(),
+                "mask {mask}: header {header:?} must match row {line:?}"
+            );
+        }
+        assert_eq!(meta_header(0), None, "no columns, no header");
         let _ = fs::remove_dir_all(&dir);
     }
 }
