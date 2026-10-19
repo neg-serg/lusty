@@ -16,6 +16,25 @@ use std::time::Instant;
 use lusty_core::listing::{self, FileKind};
 use lusty_core::{cache, colors, rank};
 
+/// Refuse to start on a root that is not a directory: an empty listing with
+/// exit 0 hides a typo, and every front-end would just show nothing.
+fn check_root(root: &std::path::Path) -> Result<(), String> {
+    match std::fs::metadata(root) {
+        Ok(meta) if meta.is_dir() => Ok(()),
+        Ok(_) => Err(format!("lusty: {}: not a directory", root.display())),
+        Err(err) => Err(format!("lusty: {}: {err}", root.display())),
+    }
+}
+
+/// Validate the root or exit with a diagnostic on stderr and code 2, the way
+/// the rest of the CLI reports a usage error.
+fn require_root(root: &std::path::Path) {
+    if let Err(message) = check_root(root) {
+        eprintln!("{message}");
+        std::process::exit(2);
+    }
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     // Debug dumps for the nvim parity smoke: the Lua tables in lusty/ru2en.lua
@@ -192,6 +211,7 @@ command-line flags win.
             }
             i += 1;
         }
+        require_root(&root);
         let _ = serve::serve(
             root,
             depth,
@@ -289,6 +309,7 @@ command-line flags win.
             .ok()
             .and_then(|v| tui::ViewMode::parse(&v));
     }
+    require_root(&root);
     let mut app = tui::App::new(root, opts);
     app.set_ui(rows, width);
     if let Some(v) = view {
@@ -363,6 +384,7 @@ fn run_list(args: &[String]) {
     }
 
     let root = root.unwrap_or_else(|| PathBuf::from("."));
+    require_root(&root);
     let opts = listing::Options {
         depth,
         skip_dirs: skip
