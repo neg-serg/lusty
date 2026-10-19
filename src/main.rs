@@ -14,7 +14,7 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use lusty_core::listing::{self, FileKind};
-use lusty_core::{cache, colors, rank};
+use lusty_core::{cache, colors, rank, text};
 
 /// Refuse to start on a root that is not a directory: an empty listing with
 /// exit 0 hides a typo, and every front-end would just show nothing.
@@ -451,7 +451,9 @@ fn push_label(out: &mut String, e: &listing::Entry, code: Option<&str>, esc: cha
         out.push_str(code);
         out.push('m');
     }
-    out.push_str(&e.label);
+    // Plumbing output still ends up on a terminal often enough: a control byte
+    // in a file name must not reach it.
+    out.push_str(&text::sanitize_display(&e.label));
     if e.kind == FileKind::Dir {
         out.push('/');
     }
