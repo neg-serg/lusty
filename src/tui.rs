@@ -21,6 +21,7 @@ use lusty_core::listing::{Entry, FileKind, Options};
 // The RU→EN table lives in the shared crate now (mirrored by the Lua front-end
 // through `lusty --ru-map`); re-exported so call sites keep their names.
 use lusty_core::rank;
+use lusty_core::text::sanitize_display;
 pub use lusty_fuzzy::layout::{normalize_query_char, ru_to_en};
 
 /// Kitty graphics protocol support: `LUSTY_KITTY` overrides (`0` disables),
@@ -1683,29 +1684,6 @@ pub(crate) fn char_width(c: char) -> usize {
 /// Display width of a string in terminal cells.
 pub(crate) fn str_width(s: &str) -> usize {
     s.chars().map(char_width).sum()
-}
-
-/// Terminal-safe copy of a label or path for the frame: a byte like ESC in a
-/// file name would otherwise let the file inject control sequences into the
-/// terminal. Returns the input unchanged (borrowed) when there is nothing to
-/// sanitize; TAB becomes a space, any other control char a '?'.
-fn sanitize_display(s: &str) -> std::borrow::Cow<'_, str> {
-    if !s.chars().any(char::is_control) {
-        return std::borrow::Cow::Borrowed(s);
-    }
-    std::borrow::Cow::Owned(
-        s.chars()
-            .map(|c| {
-                if c == '\t' {
-                    ' '
-                } else if c.is_control() {
-                    '?'
-                } else {
-                    c
-                }
-            })
-            .collect(),
-    )
 }
 
 pub(crate) fn ansi_pad(line: &mut String, width: usize) {

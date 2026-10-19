@@ -13,3 +13,4 @@ pub mod listing;
 pub mod mount;
 pub mod preview;
 pub mod rank;
+pub mod text;
