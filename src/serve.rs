@@ -51,6 +51,7 @@ use std::path::PathBuf;
 use lusty_core::cache;
 use lusty_core::listing::{Entry, FileKind, Options};
 use lusty_core::rank;
+use lusty_core::text;
 
 /// Re-sort the listing by an eza-style key. The sort helpers expect the
 /// canonical (depth, name) order and sort per depth group, so the caller
@@ -303,7 +304,9 @@ pub fn serve(
                         _ => 'f',
                     };
                     write!(out, "R {} {} ", i, kind)?;
-                    write_escaped(&mut out, e.label.as_bytes())?;
+                    // Display text: an ESC in a file name must not land in the
+                    // client's buffer. TAB/LF stay, the writer escapes them.
+                    write_escaped(&mut out, text::sanitize_wire_label(&e.label).as_bytes())?;
                     out.write_all(b"\t")?;
                     write_escaped(&mut out, e.path(&root).as_os_str().as_bytes())?;
                     out.write_all(b"\n")?;

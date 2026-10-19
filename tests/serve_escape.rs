@@ -149,3 +149,48 @@ fn serve_escapes_special_and_non_utf8_names() {
     assert!(child.wait().unwrap().success());
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn serve_replaces_control_bytes_in_labels() {
+    // A name carrying ESC must not reach the client's buffer; the path field
+    // stays byte-exact so the file can still be opened.
+    let dir = make_dir("ctrl");
+    std::fs::write(
+        dir.join(std::ffi::OsStr::from_bytes(b"esc_\x1b[2J_name")),
+        b"x",
+    )
+    .unwrap();
+
+    let (mut child, mut stdin, mut reader) = spawn(&dir);
+    let _banner = read_raw_line(&mut reader).expect("C line");
+    let _caps = read_raw_line(&mut reader).expect("X line");
+
+    writeln!(stdin, "Q\t0\t50\t").unwrap();
+    stdin.flush().unwrap();
+    let resp = until_e(&mut reader);
+    let row = resp
+        .iter()
+        .find(|r| r.starts_with(b"R "))
+        .expect("one row for the entry");
+
+    // The label is display text and must be clean; the path is a payload and
+    // keeps its bytes so the client can still open the file.
+    let tab = row
+        .iter()
+        .position(|&b| b == b'\t')
+        .expect("exactly one raw TAB separates label and path");
+    let (label, path) = (&row[..tab], &row[tab + 1..]);
+    assert!(!label.contains(&0x1b), "no raw ESC in the label: {label:?}");
+    assert!(
+        label.windows(2).any(|w| w == b"?["),
+        "the ESC is replaced by '?': {label:?}"
+    );
+    assert!(
+        path.ends_with(b"esc_\x1b[2J_name"),
+        "the path keeps its bytes: {path:?}"
+    );
+
+    drop(stdin);
+    assert!(child.wait().unwrap().success());
+    let _ = std::fs::remove_dir_all(&dir);
+}
