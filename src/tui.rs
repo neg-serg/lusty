@@ -1,12 +1,13 @@
 //! Interactive file picker: raw-mode terminal UI with dual RU/EN layout,
 //! dircolors coloring and the Lusty key bindings.
 //!
-//! Selection prints one line to stdout: ACTION<TAB>ABSOLUTE_PATH (action is
-//! edit/tabedit/split/vsplit), then exits 0. Cancel exits 1 with no output.
+//! Selection prints one line per opened path to stdout:
+//! ACTION<TAB>ABSOLUTE_PATH (action is edit/tabedit/split/vsplit), then exits 0.
+//! Every marked entry is printed, in mark order. Cancel exits 1 with no output.
 //! Directory selection and C-w re-root the picker in place.
 
 use std::io::{self, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crossterm::cursor;
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
@@ -67,6 +68,20 @@ fn load_history() -> String {
         .unwrap_or_default()
 }
 
+/// Emit the selection: one `ACTION<TAB>PATH` line per path, in the order the
+/// caller collected them (mark order). Paths go out as raw bytes so a non-UTF8
+/// name reaches the consumer verbatim instead of through a lossy `display()`.
+fn write_selection<W: Write>(out: &mut W, action: &str, paths: &[PathBuf]) -> io::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    for path in paths {
+        out.write_all(action.as_bytes())?;
+        out.write_all(b"\t")?;
+        out.write_all(path.as_os_str().as_bytes())?;
+        out.write_all(b"\n")?;
+    }
+    out.flush()
+}
+
 /// Persist the current query so the next run starts filtered the same way
 /// (the nvim pickers restore their last input in the same fashion).
 fn store_history(query: &str) {
@@ -118,6 +133,9 @@ pub struct App {
     ranked: Vec<usize>,
     needs_rank: bool,
     selected: usize,
+    /// Marked entries in mark order. Absolute paths, so marks survive a new
+    /// query, a sort change and a re-root; toggling removes duplicates.
+    marked: Vec<PathBuf>,
     offset: usize,
     size: (usize, usize),
     cursor_row: Option<usize>,
@@ -159,6 +177,7 @@ impl App {
             ranked: Vec::new(),
             needs_rank: true,
             selected: 0,
+            marked: Vec::new(),
             offset: 0,
             size: (80, 24),
             cursor_row: None,
@@ -345,6 +364,39 @@ impl App {
         self.selected = ((self.selected as isize + delta).rem_euclid(n as isize)) as usize;
     }
 
+    /// Mark or unmark the entry under the cursor (C-x). Marking steps to the
+    /// next entry, so a run of files can be collected without extra keys;
+    /// unmarking stays put so a mistake is one keystroke to undo.
+    fn toggle_mark(&mut self) {
+        if self.ranked.is_empty() {
+            return;
+        }
+        let path = self.entry_at(self.selected).path(&self.root);
+        match self.marked.iter().position(|p| *p == path) {
+            Some(i) => {
+                self.marked.remove(i);
+            }
+            None => {
+                self.marked.push(path);
+                self.move_sel(1);
+            }
+        }
+    }
+
+    fn is_marked(&self, path: &Path) -> bool {
+        self.marked.iter().any(|p| p == path)
+    }
+
+    /// What Enter emits: every marked entry in mark order, or just the entry
+    /// under the cursor when nothing is marked.
+    fn selection_paths(&self, cursor: &Entry) -> Vec<PathBuf> {
+        if self.marked.is_empty() {
+            vec![cursor.path(&self.root)]
+        } else {
+            self.marked.clone()
+        }
+    }
+
     /// Move `delta` whole columns in the column-major grid (see `grid_index`):
     /// a column holds `row_count` entries, right wraps to the first column and
     /// left to the last one. A target column shorter than the current row (the
@@ -397,6 +449,9 @@ impl App {
         self.offset = 0;
     }
 
+    /// Open the entry under the cursor: directories re-root the picker, files
+    /// end it. With marks present every marked path is emitted, in the order
+    /// they were marked, one `ACTION<TAB>PATH` line each.
     fn open(&mut self, action: &str) -> io::Result<()> {
         if self.ranked.is_empty() {
             return Ok(());
@@ -406,6 +461,7 @@ impl App {
             self.re_root(entry.path(&self.root));
             return Ok(());
         }
+        let paths = self.selection_paths(&entry);
         // No alternate screen here: the picker usually runs inside a nvim
         // terminal buffer (possibly itself inside a web xterm), whose
         // alt-screen emulation is unreliable. The shim deletes the buffer on
@@ -419,14 +475,7 @@ impl App {
         terminal::disable_raw_mode()?;
         execute!(io::stdout(), cursor::Show)?;
         let mut so = io::stdout().lock();
-        // Raw bytes: the consumer (shell/nvim) opens this path verbatim, so a
-        // non-UTF8 name must not go through the lossy `display()`.
-        use std::os::unix::ffi::OsStrExt;
-        so.write_all(action.as_bytes())?;
-        so.write_all(b"\t")?;
-        so.write_all(entry.path(&self.root).as_os_str().as_bytes())?;
-        so.write_all(b"\n")?;
-        so.flush()?;
+        write_selection(&mut so, action, &paths)?;
         store_history(&self.query);
         std::process::exit(0);
     }
@@ -881,6 +930,9 @@ impl App {
                             }
                             // C-l cycles the entry layout list -> grid -> long.
                             (KeyCode::Char('l'), true) => self.view = self.view.next(),
+                            // C-x marks the cursor entry (and steps down) so
+                            // Enter can open several files at once.
+                            (KeyCode::Char('x'), true) => self.toggle_mark(),
                             // C-y cycles the sort order like the nvim float: drop
                             // the cached listing so the next draw re-sorts it.
                             (KeyCode::Char('y'), true) => {
@@ -1069,7 +1121,9 @@ impl App {
             };
             if header_row {
                 let h = long_header.as_deref().unwrap_or_default();
-                line.push_str(&format!("{esc}[38;2;108;126;150m{h} NAME"));
+                // One space for the mark column, so NAME lines up with the
+                // labels below.
+                line.push_str(&format!("{esc}[38;2;108;126;150m {h} NAME"));
                 line.push_str(&revert);
                 self.close_row(&mut frame, &mut line, r, esc, lw, w);
             } else if let Some(er) = entry_row {
@@ -1083,25 +1137,41 @@ impl App {
                         if pos < self.ranked.len() {
                             let i = self.ranked[pos];
                             let e = self.listing()[i].clone();
+                            let marked = self.is_marked(&e.path(&root_path));
+                            let selected = pos == self.selected;
+                            // Tint the whole cell — mark column and padding
+                            // included — with the selection background, or with
+                            // the mark background when the cursor is elsewhere.
+                            if selected {
+                                cell.push_str(&format!("{esc}[{}m", sel_style()));
+                            } else if marked {
+                                cell.push_str(&format!("{esc}[{MARK_BG}m"));
+                            }
+                            // One-cell mark column. A glyph, not just a tint:
+                            // the mark has to survive a monochrome terminal.
+                            cell.push_str(if marked { "+" } else { " " });
                             if self.shows_meta() {
                                 if let Some(m) = lusty_core::listing::meta_line(
                                     &e.path(&root_path),
                                     self.cols_mask,
                                 ) {
                                     cell.push_str(&format!("{esc}[38;2;108;126;150m{m}"));
-                                    cell.push_str(&revert);
+                                    // Drop the dim meta foreground but keep the
+                                    // cell background.
+                                    cell.push_str(&format!("{esc}[39m"));
                                     cell.push(' ');
                                 }
                             }
-                            if pos == self.selected {
+                            if selected {
+                                // Restore the selection foreground after the
+                                // meta reset; the background is already on.
                                 cell.push_str(&format!("{esc}[{}m", sel_style()));
-                            } else {
-                                let exec = e.kind == FileKind::File && is_exec(&e.path(&root_path));
-                                if let Some(code) =
-                                    self.palette.code_for(e.basename(), e.kind, exec)
-                                {
-                                    cell.push_str(&format!("{esc}[{code}m"));
-                                }
+                            } else if let Some(code) = self.palette.code_for(
+                                e.basename(),
+                                e.kind,
+                                is_exec(&e.path(&root_path)),
+                            ) {
+                                cell.push_str(&format!("{esc}[{code}m"));
                             }
                             if self.icons {
                                 cell.push_str(icon_for(&e));
@@ -1272,6 +1342,15 @@ impl App {
             "38;2;108;126;150",
             &mut out,
         );
+        // Marked entries: a running total, signed so it does not read as part
+        // of the filter counter.
+        if !self.marked.is_empty() {
+            push_painted(
+                &format!("  +{}", self.marked.len()),
+                "38;2;108;126;150",
+                &mut out,
+            );
+        }
         out.push(esc);
         out.push_str("[22;23;24;39m");
         out
@@ -1285,6 +1364,10 @@ const OUTER_ROWS: usize = 8;
 /// shared by the frame itself and the per-row finisher.
 const FRAME_BG: &str = "48;2;0;0;0";
 const FRAME_BORDER: &str = "38;2;58;68;84";
+/// Background of a marked entry. The cursor row keeps the selection
+/// background and wins while it sits on a marked entry, so the two states stay
+/// apart; the `+` mark column repeats the difference without relying on colour.
+const MARK_BG: &str = "48;2;0;70;60";
 
 /// Selection theme loaded from the Lusty TOML (env `LUSTY_THEME`; by default
 /// the nvim copy at `$XDG_CONFIG_HOME/nvim/lua/lusty/theme.toml`, then the
@@ -2186,6 +2269,108 @@ mod view_test {
         assert!(
             rows.iter().any(|r| r.contains("0/20")),
             "prompt keeps the total while filtering: {rows:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn toggle_mark_collects_paths_and_advances() {
+        let (mut app, dir) = layout_fixture("marks");
+        let root = app.root.clone();
+        let first = app.entry_at(0).path(&root);
+        let second = app.entry_at(1).path(&root);
+
+        app.toggle_mark();
+        assert_eq!(app.marked, vec![first.clone()], "marking appends");
+        assert_eq!(app.selected, 1, "marking steps to the next entry");
+        app.toggle_mark();
+        assert_eq!(app.marked, vec![first, second.clone()]);
+        assert_eq!(app.selected, 2);
+
+        app.selected = 0;
+        app.toggle_mark();
+        assert_eq!(app.marked, vec![second], "unmarking drops the entry");
+        assert_eq!(app.selected, 0, "unmarking keeps the cursor in place");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn selection_paths_follow_the_marks() {
+        let (mut app, dir) = layout_fixture("marks_out");
+        let root = app.root.clone();
+        let cursor = app.entry_at(0);
+        assert_eq!(
+            app.selection_paths(&cursor),
+            vec![cursor.path(&root)],
+            "no marks: only the cursor entry"
+        );
+        app.toggle_mark(); // marks entry 0, cursor moves to 1
+        let cursor = app.entry_at(1);
+        assert_eq!(
+            app.selection_paths(&cursor),
+            vec![app.entry_at(0).path(&root)],
+            "marks win over the cursor, in mark order"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn selection_prints_one_line_per_path() {
+        use std::os::unix::ffi::OsStrExt;
+        let paths = vec![
+            PathBuf::from("/tmp/plain.txt"),
+            PathBuf::from(std::ffi::OsStr::from_bytes(b"/tmp/non\xe9.txt")),
+        ];
+        let mut out: Vec<u8> = Vec::new();
+        write_selection(&mut out, "edit", &paths).expect("write");
+        let mut want: Vec<u8> = Vec::new();
+        want.extend_from_slice(b"edit\t/tmp/plain.txt\n");
+        // Raw bytes: a non-UTF8 name must reach the consumer verbatim.
+        want.extend_from_slice(b"edit\t/tmp/non\xe9.txt\n");
+        assert_eq!(out, want);
+    }
+
+    #[test]
+    fn a_marked_entry_is_tinted_and_marked_with_a_glyph() {
+        let (mut app, dir) = layout_fixture("mark_view");
+        app.view = ViewMode::List;
+        app.ensure_ranked();
+        app.toggle_mark(); // marks f00, cursor steps to f01
+        let rows = frame_parts(&mut app);
+
+        let marked = rows
+            .iter()
+            .find(|r| r.contains("f00.txt"))
+            .expect("marked row");
+        assert!(
+            plain(marked).contains("+f00.txt"),
+            "the mark column carries a glyph: {:?}",
+            plain(marked)
+        );
+        assert!(
+            marked.contains(MARK_BG),
+            "the marked cell carries the mark background"
+        );
+
+        let plain_row = rows
+            .iter()
+            .find(|r| r.contains("f01.txt"))
+            .expect("unmarked row");
+        assert!(
+            plain(plain_row).contains("\u{2502} f01.txt"),
+            "an unmarked cell keeps the marker column blank: {:?}",
+            plain(plain_row)
+        );
+        assert!(!plain_row.contains(MARK_BG), "no mark tint without a mark");
+
+        let prompt = rows
+            .iter()
+            .find(|r| plain(r).contains("d1"))
+            .expect("prompt row");
+        assert!(
+            plain(prompt).contains("+1"),
+            "the prompt counts the marks: {:?}",
+            plain(prompt)
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -59,6 +59,12 @@ cycles the sort order
 (name/ext/size/time; `--sort` picks the starting order), C-d cycles the search
 depth (1..6). The last typed query is restored on the next run.
 
+C-x marks the entry under the cursor and steps to the next one. Marks survive
+re-filtering, sorting and re-rooting; the prompt shows `+N`, and Enter then
+prints one `ACTION<TAB>PATH` line per marked entry, in the order they were
+marked. Marked cells keep a `+` in a one-cell column, so the state does not
+depend on the tint alone.
+
 `list` is one entry per row, `grid` (the default) packs as many adaptive
 columns as the popup width allows — filled top-to-bottom, columns left to
 right — and `long` puts the eza `-l` style mode/size/date in front of each
