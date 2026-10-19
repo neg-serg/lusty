@@ -174,6 +174,8 @@ fn main() {
   --icon-map   print the icon table (parity smoke)
   --theme-map  print the resolved theme (parity smoke)
   --color-map  resolve LS_COLORS probes (parity smoke)
+  --color-map takes <kind>:<name>[:exec] probes as arguments.
+  --fuzzy-vectors  score the corpus read from stdin and print JSON (parity)
 
 Size may also come from LUSTY_ROWS / LUSTY_WIDTH env vars;
 command-line flags win.
