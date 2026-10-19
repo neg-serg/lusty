@@ -14,6 +14,7 @@ use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
 use crossterm::execute;
 use crossterm::terminal::{self};
 
+use crate::contrast;
 use lusty_core::cache;
 use lusty_core::colors::{self, Colors};
 use lusty_core::listing::{Entry, FileKind, Options};
@@ -1123,7 +1124,7 @@ impl App {
                 let h = long_header.as_deref().unwrap_or_default();
                 // One space for the mark column, so NAME lines up with the
                 // labels below.
-                line.push_str(&format!("{esc}[38;2;108;126;150m {h} NAME"));
+                line.push_str(&format!("{esc}[{DIM_FG}m {h} NAME"));
                 line.push_str(&revert);
                 self.close_row(&mut frame, &mut line, r, esc, lw, w);
             } else if let Some(er) = entry_row {
@@ -1149,13 +1150,21 @@ impl App {
                             }
                             // One-cell mark column. A glyph, not just a tint:
                             // the mark has to survive a monochrome terminal.
+                            // Its own foreground keeps the glyph readable on
+                            // the mark tint whatever the terminal default is.
+                            if marked {
+                                cell.push_str(&format!("{esc}[{MARK_FG}m"));
+                            }
                             cell.push_str(if marked { "+" } else { " " });
+                            if marked {
+                                cell.push_str(&format!("{esc}[39m"));
+                            }
                             if self.shows_meta() {
                                 if let Some(m) = lusty_core::listing::meta_line(
                                     &e.path(&root_path),
                                     self.cols_mask,
                                 ) {
-                                    cell.push_str(&format!("{esc}[38;2;108;126;150m{m}"));
+                                    cell.push_str(&format!("{esc}[{DIM_FG}m{m}"));
                                     // Drop the dim meta foreground but keep the
                                     // cell background.
                                     cell.push_str(&format!("{esc}[39m"));
@@ -1284,7 +1293,7 @@ impl App {
         let mut out = String::new();
         if self.icons {
             out.push(esc);
-            out.push_str("[38;2;108;126;150m");
+            out.push_str(&format!("[{DIM_FG}m"));
             out.push_str(ICON_DIR);
             out.push(' ');
         }
@@ -1339,17 +1348,13 @@ impl App {
                 self.ranked.len(),
                 self.total
             ),
-            "38;2;108;126;150",
+            DIM_FG,
             &mut out,
         );
         // Marked entries: a running total, signed so it does not read as part
         // of the filter counter.
         if !self.marked.is_empty() {
-            push_painted(
-                &format!("  +{}", self.marked.len()),
-                "38;2;108;126;150",
-                &mut out,
-            );
+            push_painted(&format!("  +{}", self.marked.len()), DIM_FG, &mut out);
         }
         out.push(esc);
         out.push_str("[22;23;24;39m");
@@ -1368,6 +1373,13 @@ const FRAME_BORDER: &str = "38;2;58;68;84";
 /// background and wins while it sits on a marked entry, so the two states stay
 /// apart; the `+` mark column repeats the difference without relying on colour.
 const MARK_BG: &str = "48;2;0;70;60";
+/// Foreground of the `+` mark column, so the marker itself stays readable on
+/// the mark tint instead of inheriting whatever the terminal default is.
+const MARK_FG: &str = "38;2;209;229;255";
+/// Dim tone of the meta columns, the long header, the depth and the counter:
+/// readable on the popup background, clearly secondary (see the
+/// `contrast_invariants` tests).
+const DIM_FG: &str = "38;2;108;126;150";
 
 /// Selection theme loaded from the Lusty TOML (env `LUSTY_THEME`; by default
 /// the nvim copy at `$XDG_CONFIG_HOME/nvim/lua/lusty/theme.toml`, then the
@@ -1382,6 +1394,43 @@ struct Theme {
     sel_reverse: bool,
     match_fg: Option<[u8; 3]>,
     match_underline: bool,
+}
+
+impl Theme {
+    /// Enforce the legibility invariants on a parsed theme: the selection has
+    /// to stand out from the popup and carry readable text, and the match
+    /// highlight has to stay readable on both backgrounds it is painted over.
+    /// A field that breaks its floor falls back to the default, so a bad
+    /// theme.toml degrades to readable colours instead of an unreadable frame.
+    fn sanitized(mut self) -> Theme {
+        let default = theme_default();
+        let popup = contrast::sgr_rgb(FRAME_BG).unwrap_or([0, 0, 0]);
+        if let Some(bg) = self.sel_bg {
+            if contrast::contrast_ratio(bg, popup) < contrast::MIN_UI {
+                self.sel_bg = default.sel_bg;
+            }
+        }
+        let sel_bg = self.sel_bg.or(default.sel_bg);
+        if let Some(fg) = self.sel_fg {
+            let ratio = sel_bg
+                .map(|bg| contrast::contrast_ratio(fg, bg))
+                .unwrap_or(contrast::MIN_TEXT);
+            if ratio < contrast::MIN_TEXT {
+                self.sel_fg = default.sel_fg;
+            }
+        }
+        if let Some(fg) = self.match_fg {
+            let on_popup = contrast::contrast_ratio(fg, popup);
+            let on_sel = match sel_bg {
+                Some(bg) => contrast::contrast_ratio(fg, bg),
+                None => contrast::MIN_TEXT,
+            };
+            if on_popup < contrast::MIN_TEXT || on_sel < contrast::MIN_TEXT {
+                self.match_fg = default.match_fg;
+            }
+        }
+        self
+    }
 }
 
 fn hex3(s: &str) -> Option<[u8; 3]> {
@@ -1463,7 +1512,7 @@ fn load_theme() -> Theme {
             _ => {}
         }
     }
-    t
+    t.sanitized()
 }
 
 /// Resolved theme as `key\tvalue` lines, used by `--theme-map` and the nvim
@@ -2373,6 +2422,123 @@ mod view_test {
             plain(prompt)
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod contrast_invariants {
+    use super::*;
+
+    /// The colour a paint constant actually carries.
+    fn rgb(sgr: &str) -> [u8; 3] {
+        contrast::sgr_rgb(sgr).expect("an rgb SGR constant")
+    }
+
+    #[test]
+    fn secondary_text_stays_readable_on_the_popup() {
+        let ratio = contrast::contrast_ratio(rgb(DIM_FG), rgb(FRAME_BG));
+        assert!(
+            ratio >= contrast::MIN_TEXT,
+            "the meta/header/counter tone is {ratio:.2}:1 on the popup, need {}:1",
+            contrast::MIN_TEXT
+        );
+    }
+
+    #[test]
+    fn the_selection_stands_out_and_its_text_is_readable() {
+        let theme = theme_default();
+        let popup = rgb(FRAME_BG);
+        let bg = theme.sel_bg.expect("the default theme paints a bar");
+        let bar = contrast::contrast_ratio(bg, popup);
+        assert!(
+            bar >= contrast::MIN_UI,
+            "the selection bar is {bar:.2}:1 against the popup, need {}:1",
+            contrast::MIN_UI
+        );
+        let fg = theme.sel_fg.expect("the default theme sets a foreground");
+        let text = contrast::contrast_ratio(fg, bg);
+        assert!(
+            text >= contrast::MIN_TEXT,
+            "selection text is {text:.2}:1 on the bar, need {}:1",
+            contrast::MIN_TEXT
+        );
+    }
+
+    #[test]
+    fn the_selection_does_not_rely_on_colour_alone() {
+        let theme = theme_default();
+        assert!(
+            theme.sel_bold || theme.sel_underline || theme.sel_reverse,
+            "the cursor needs a non-colour cue as well"
+        );
+    }
+
+    #[test]
+    fn the_mark_glyph_is_readable_on_its_tint() {
+        let mark = rgb(MARK_BG);
+        let glyph = contrast::contrast_ratio(rgb(MARK_FG), mark);
+        assert!(
+            glyph >= contrast::MIN_TEXT,
+            "the + marker is {glyph:.2}:1 on the mark tint, need {}:1",
+            contrast::MIN_TEXT
+        );
+        // The tint is the second cue; the glyph is the first, so the tint only
+        // has to be perceivable.
+        let tint = contrast::contrast_ratio(mark, rgb(FRAME_BG));
+        assert!(
+            tint >= contrast::MIN_DECOR,
+            "the mark tint is {tint:.2}:1 against the popup, need {}:1",
+            contrast::MIN_DECOR
+        );
+    }
+
+    #[test]
+    fn the_frame_line_stays_perceivable() {
+        // Decoration, not information: the frame carries no meaning on its own,
+        // so it is held to the decorative floor instead of 3:1.
+        let ratio = contrast::contrast_ratio(rgb(FRAME_BORDER), rgb(FRAME_BG));
+        assert!(
+            ratio >= contrast::MIN_DECOR,
+            "the frame line is {ratio:.2}:1 against the popup, need {}:1",
+            contrast::MIN_DECOR
+        );
+    }
+
+    #[test]
+    fn the_sanitizer_rejects_an_unreadable_theme() {
+        // A bar indistinguishable from the popup background.
+        let bad = Theme {
+            sel_bg: Some([0, 0, 0]),
+            ..theme_default()
+        };
+        assert_eq!(
+            bad.sanitized().sel_bg,
+            theme_default().sel_bg,
+            "an invisible selection bar falls back to the default"
+        );
+
+        // Selection text painted in the bar colour: 1:1 contrast.
+        let bar = theme_default().sel_bg.expect("a default bar");
+        let bad = Theme {
+            sel_fg: Some(bar),
+            ..theme_default()
+        };
+        assert_eq!(
+            bad.sanitized().sel_fg,
+            theme_default().sel_fg,
+            "unreadable selection text falls back to the default"
+        );
+
+        // A match highlight that vanishes on the selection bar.
+        let bad = Theme {
+            match_fg: Some(bar),
+            ..theme_default()
+        };
+        assert_eq!(
+            bad.sanitized().match_fg,
+            theme_default().match_fg,
+            "an unreadable match highlight falls back to the default"
+        );
     }
 }
 
