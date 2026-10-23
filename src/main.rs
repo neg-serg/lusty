@@ -113,6 +113,44 @@ fn main() {
         }
         return;
     }
+    if args.first().map(|s| s.as_str()) == Some("--key-map") {
+        // Resolved keymap for the nvim parity smoke: one line per action,
+        // "action<TAB>key1 key2". LUSTY_KEYS and any --keys arguments apply
+        // first, so the dump shows what the picker would actually do.
+        let mut map = lusty_core::keys::Keymap::defaults();
+        if let Ok(spec) = std::env::var("LUSTY_KEYS") {
+            map.apply(&spec);
+        }
+        let mut i = 1;
+        while i < args.len() {
+            if args[i] == "--keys" {
+                i += 1;
+                if let Some(spec) = args.get(i) {
+                    map.apply(spec);
+                }
+            }
+            i += 1;
+        }
+        for (action, keys) in map.entries() {
+            let keys = keys.iter().map(|k| k.spec()).collect::<Vec<_>>().join(" ");
+            println!("{}\t{}", action.name(), keys);
+        }
+        return;
+    }
+    if args.first().map(|s| s.as_str()) == Some("--icon-color-map") {
+        // Icon colours for the nvim parity smoke: "<name>" arguments in, one
+        // "name<TAB>rrggbb" line each (an empty second field means "no colour",
+        // i.e. keep the LS_COLORS foreground).
+        let theme = lusty_core::icon_theme::IconTheme::load();
+        for name in args.iter().skip(1) {
+            let color = theme
+                .color_for(name)
+                .map(|[r, g, b]| format!("{r:02x}{g:02x}{b:02x}"))
+                .unwrap_or_default();
+            println!("{name}\t{color}");
+        }
+        return;
+    }
     if args.first().map(|s| s.as_str()) == Some("--theme-map") {
         // Resolved theme (honours LUSTY_THEME) for the nvim parity smoke.
         for (key, value) in tui::theme_dump() {
@@ -160,18 +198,24 @@ fn main() {
   --width N popup total width incl borders (default: full terminal width)
   --long    same as --view long (eza -l style rows)
   --view M  list (one column), grid (default, adaptive columns), or long;
-            also LUSTY_VIEW=list|grid|long, C-l cycles them in the picker
+            also LUSTY_VIEW=list|grid|long, alt-v cycles them in the picker
   --sort S  start order: name (default), ext, size (desc), time (desc)
   --reverse reverse each depth group (eza --reverse)
   --dirs-first  group directories first per depth
   --columns C   long-view fields: perm,user,size,time (default all)
   --icons   nerd-font icons (also LUSTY_ICONS=1)
   --query Q start with Q typed in the prompt
+  --locked  start in locked mode: paths stay anchored at the launch dir and
+            C-Space prints the cd target (also LUSTY_LOCK_CWD=1)
+  --show-hidden  list dot entries from the start (also LUSTY_SHOW_HIDDEN=1)
 
   serve: line protocol on stdin/stdout for the nvim client (see README)
 
   --ru-map     print the RU->EN key table (parity smoke)
   --icon-map   print the icon table (parity smoke)
+  --key-map    print the resolved action keymap (parity smoke)
+  --keys SPEC  rebind actions: key=action,key=action (also LUSTY_KEYS)
+  --icon-color-map NAME...  resolve theme.yml icon colours (parity smoke)
   --theme-map  print the resolved theme (parity smoke)
   --color-map  resolve LS_COLORS probes (parity smoke)
   --color-map takes <kind>:<name>[:exec] probes as arguments.
@@ -240,6 +284,9 @@ command-line flags win.
     let mut columns: Option<String> = None;
     let mut icons = false;
     let mut query = String::new();
+    let mut key_specs: Vec<String> = Vec::new();
+    let mut locked = false;
+    let mut show_hidden = false;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -287,6 +334,14 @@ command-line flags win.
                 i += 1;
                 columns = args.get(i).cloned();
             }
+            "--keys" => {
+                i += 1;
+                if let Some(spec) = args.get(i) {
+                    key_specs.push(spec.clone());
+                }
+            }
+            "--locked" => locked = true,
+            "--show-hidden" => show_hidden = true,
             other if !other.starts_with("--") => {
                 root = PathBuf::from(other);
             }
@@ -314,6 +369,25 @@ command-line flags win.
     require_root(&root);
     let mut app = tui::App::new(root, opts);
     app.set_ui(rows, width);
+    // Key overrides: the environment first, then every --keys argument, so a
+    // command line can layer on top of the shell config. A bad entry costs one
+    // binding and is reported here, before the terminal goes raw.
+    if let Ok(spec) = std::env::var("LUSTY_KEYS") {
+        for warning in app.set_keys(&spec) {
+            eprintln!("lusty: LUSTY_KEYS: {warning}");
+        }
+    }
+    for spec in &key_specs {
+        for warning in app.set_keys(spec) {
+            eprintln!("lusty: --keys: {warning}");
+        }
+    }
+    if locked {
+        app.set_locked(true);
+    }
+    if show_hidden {
+        app.set_hidden(true);
+    }
     if let Some(v) = view {
         app.set_view(v);
     }
