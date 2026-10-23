@@ -5,6 +5,11 @@
 //! ACTION<TAB>ABSOLUTE_PATH (action is edit/tabedit/split/vsplit), then exits 0.
 //! Every marked entry is printed, in mark order. Cancel exits 1 with no output.
 //! Directory selection and C-w re-root the picker in place.
+//!
+//! The interaction layer — action registry, directory history, locked mode,
+//! help overlay, status flags, path insertion — is ported from
+//! `fzf-navigator` (see CREDITS.md); `lusty-core::{keys, history, paths,
+//! icon_theme}` holds the parts that need no terminal.
 
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -17,7 +22,11 @@ use crossterm::terminal::{self};
 use crate::contrast;
 use lusty_core::cache;
 use lusty_core::colors::{self, Colors};
+use lusty_core::history::DirHistory;
+use lusty_core::icon_theme::IconTheme;
+use lusty_core::keys::{Action, Key, Keymap, NamedKey, BUILTIN_HELP};
 use lusty_core::listing::{Entry, FileKind, Options};
+use lusty_core::paths;
 // The RU→EN table lives in the shared crate now (mirrored by the Lua front-end
 // through `lusty --ru-map`); re-exported so call sites keep their names.
 use lusty_core::rank;
@@ -84,6 +93,124 @@ fn write_selection<W: Write>(out: &mut W, action: &str, paths: &[PathBuf]) -> io
     out.flush()
 }
 
+/// Same framing as [`write_selection`] for values that are already text: the
+/// `insert` action emits paths relative to the launch directory, which are
+/// strings by construction (see [`paths::insert_paths`]).
+fn write_lines<W: Write>(out: &mut W, action: &str, items: &[String]) -> io::Result<()> {
+    for item in items {
+        out.write_all(action.as_bytes())?;
+        out.write_all(b"\t")?;
+        out.write_all(item.as_bytes())?;
+        out.write_all(b"\n")?;
+    }
+    out.flush()
+}
+
+/// Base64 for the OSC 52 clipboard payload (RFC 4648 alphabet, padded). Small
+/// enough to keep in-tree instead of pulling a dependency for one escape.
+fn base64(input: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
+    for chunk in input.chunks(3) {
+        let b = [
+            chunk[0],
+            *chunk.get(1).unwrap_or(&0),
+            *chunk.get(2).unwrap_or(&0),
+        ];
+        let n = ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | b[2] as u32;
+        out.push(ALPHABET[(n >> 18) as usize & 63] as char);
+        out.push(ALPHABET[(n >> 12) as usize & 63] as char);
+        out.push(if chunk.len() > 1 {
+            ALPHABET[(n >> 6) as usize & 63] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            ALPHABET[n as usize & 63] as char
+        } else {
+            '='
+        });
+    }
+    out
+}
+
+/// OSC 52 clipboard write. The selection is not echoed to the terminal and the
+/// sequence is a no-op on terminals that do not implement it, which is why the
+/// picker also reports the copy in its status line.
+fn osc52(text: &str) -> String {
+    format!("\u{1b}]52;c;{}\u{1b}\\", base64(text.as_bytes()))
+}
+
+/// Map a crossterm event onto the registry's key type. Shift is folded into the
+/// character (`Shift-p` arrives as `Char('P')`), and a NUL byte — how terminals
+/// report `ctrl-space` — becomes the named space key.
+fn key_from_event(code: KeyCode, modifiers: KeyModifiers) -> Option<Key> {
+    let ctrl = modifiers.contains(KeyModifiers::CONTROL);
+    let alt = modifiers.contains(KeyModifiers::ALT);
+    let named = match code {
+        KeyCode::Esc => Some(NamedKey::Esc),
+        KeyCode::Enter => Some(NamedKey::Enter),
+        KeyCode::Tab => Some(NamedKey::Tab),
+        KeyCode::Backspace => Some(NamedKey::Backspace),
+        KeyCode::Delete => Some(NamedKey::Delete),
+        KeyCode::Up => Some(NamedKey::Up),
+        KeyCode::Down => Some(NamedKey::Down),
+        KeyCode::Left => Some(NamedKey::Left),
+        KeyCode::Right => Some(NamedKey::Right),
+        KeyCode::Home => Some(NamedKey::Home),
+        KeyCode::End => Some(NamedKey::End),
+        KeyCode::PageUp => Some(NamedKey::PageUp),
+        KeyCode::PageDown => Some(NamedKey::PageDown),
+        _ => None,
+    };
+    if let Some(named) = named {
+        return Some(Key::named(named).with_ctrl(ctrl).with_alt(alt));
+    }
+    match code {
+        KeyCode::Char('\0') => Some(Key::named(NamedKey::Space).with_ctrl(true)),
+        KeyCode::Char(c) => Some(Key::ch(c).with_ctrl(ctrl).with_alt(alt)),
+        _ => None,
+    }
+}
+
+/// A printable key is one that must reach the prompt when the prompt is not
+/// empty: the ported browse-mode keys (`/`, `[`, `\`, `?`) are shadows of real
+/// characters, and eating them would make them untypeable.
+fn is_printable(key: Key) -> bool {
+    matches!(key.char(), Some(c) if (c.is_ascii_graphic() || c == ' ') && !key.ctrl && !key.alt)
+}
+
+/// Where one press goes: an action, or the prompt as text.
+///
+/// The registry owns modified keys (ctrl/alt/named) unconditionally. A key that
+/// *prints* a character owns the press only while the prompt is empty — that is
+/// the browse mode the shell version lives in. Once there is text to extend,
+/// the character is typed, so `,`, `.`, `/`, `?`, `[` and `\` all stay reachable
+/// (`/` is the exception: it is the descend key and decides for itself whether
+/// it descends or types a slash).
+fn route_key(keymap: &Keymap, key: Key, query: &str) -> Option<Action> {
+    let action = keymap.action_of(key)?;
+    if query.is_empty() || action == Action::Descend || !is_printable(key) {
+        return Some(action);
+    }
+    None
+}
+
+/// Append one typed character to the query, going through the RU→EN layout
+/// table. This is the **only** place a character enters the prompt, so a
+/// comma stays a comma, a dot stays a dot and a slash stays a slash: the table
+/// maps Cyrillic letters back to their EN keys and passes every printable
+/// ASCII character through untouched. Returns whether the query changed.
+fn type_into(query: &mut String, ch: char) -> bool {
+    match normalize_query_char(ch) {
+        Some(c) => {
+            query.push(c);
+            true
+        }
+        None => false,
+    }
+}
+
 /// Persist the current query so the next run starts filtered the same way
 /// (the nvim pickers restore their last input in the same fashion).
 fn store_history(query: &str) {
@@ -116,7 +243,7 @@ impl ViewMode {
         }
     }
 
-    /// Next mode for the C-l cycle: list -> grid -> long -> list.
+    /// Next mode for the `alt-v` cycle: list -> grid -> long -> list.
     pub fn next(self) -> ViewMode {
         match self {
             ViewMode::List => ViewMode::Grid,
@@ -155,7 +282,7 @@ pub struct App {
     maxw: usize,             // widest label (chars) in the current listing
     total: usize,            // entries in the listing the current query filters
     palette: Colors,
-    preview_on: bool,         // right preview pane (C-Space / Shift+P toggles)
+    preview_on: bool,         // right preview pane (alt-p toggles)
     preview_w: usize,         // pane width in columns
     pane_kind: u8,            // 0 off, 1 dim text (git/man/info), 2 chafa art
     pane: Vec<String>,        // pre-clipped pane rows (preview_w wide)
@@ -165,11 +292,26 @@ pub struct App {
     kitty: bool,                // terminal speaks the kitty graphics protocol
     kitty_drawn: bool,          // an image is currently placed
     kitty_key: Option<String>,  // pane key the placed image belongs to
+    // --- ported from fzf-navigator (see CREDITS.md) ---
+    keymap: Keymap,              // action registry: key dispatch and `?` help share it
+    history: DirHistory,         // back/forward/session-start over browsed directories
+    locked: bool,                // `L`: keep the launch dir as the anchor for paths
+    dots_on: bool,               // `H`: hidden files shown regardless of the query
+    skipped_on: bool,            // `I`: prune the --skip directories
+    skip_spec: Vec<String>,      // the --skip list `I` toggles
+    help_on: bool,               // `?`: keymap overlay instead of the entry grid
+    help_offset: usize,          // first help row on screen
+    notice: Option<String>,      // one-shot status line (copied N paths, reloaded…)
+    hidden_shown: usize,         // entries hidden by the dot rule, for the `-N` flag
+    hidden_count: Option<usize>, // memoised readdir count behind `-N`
+    icon_theme: Option<IconTheme>, // per-extension icon colours from theme.yml
 }
 
 impl App {
     pub fn new(root: PathBuf, opts: Options) -> App {
         let palette = colors::load();
+        let skip_spec = opts.skip_dirs.clone();
+        let history = DirHistory::new(root.clone());
         App {
             root,
             opts,
@@ -209,7 +351,42 @@ impl App {
             kitty: kitty_enabled(),
             kitty_drawn: false,
             kitty_key: None,
+            keymap: Keymap::defaults(),
+            history,
+            locked: std::env::var("LUSTY_LOCK_CWD")
+                .map(|v| v == "1")
+                .unwrap_or(false),
+            dots_on: std::env::var("LUSTY_SHOW_HIDDEN")
+                .map(|v| v == "1")
+                .unwrap_or(false),
+            skipped_on: true,
+            skip_spec,
+            help_on: false,
+            help_offset: 0,
+            notice: None,
+            hidden_shown: 0,
+            hidden_count: None,
+            icon_theme: Some(IconTheme::load()),
         }
+    }
+
+    /// Apply a `LUSTY_KEYS` / `--keys` override spec; warnings are returned so
+    /// the caller can print them before the terminal goes raw (a typo costs one
+    /// binding, never the picker).
+    pub fn set_keys(&mut self, spec: &str) -> Vec<lusty_core::keys::SpecWarning> {
+        self.keymap.apply(spec)
+    }
+
+    /// Start in locked mode: the launch directory stays the anchor and `exit`
+    /// prints the `cd` target (CLI `--locked`, env `LUSTY_LOCK_CWD=1`).
+    pub fn set_locked(&mut self, on: bool) {
+        self.locked = on;
+    }
+
+    /// Start with dot entries listed (CLI `--show-hidden`, env
+    /// `LUSTY_SHOW_HIDDEN=1`); `H` toggles it at runtime.
+    pub fn set_hidden(&mut self, on: bool) {
+        self.dots_on = on;
     }
 
     /// Override the popup size. CLI flags win over LUSTY_ROWS/LUSTY_WIDTH
@@ -270,8 +447,10 @@ impl App {
         self.ui_width = width.or_else(|| env_usize("LUSTY_WIDTH"));
     }
 
+    /// Dot entries are shown when the query starts with `.` (the original
+    /// LustyExplorer rule) or when `H` turned them on for the whole session.
     fn show_dots(&self) -> bool {
-        self.query.starts_with('.')
+        self.dots_on || self.query.starts_with('.')
     }
 
     /// The listing backing the current view (hidden or dot-shown), listed on
@@ -346,6 +525,7 @@ impl App {
         entries[i].clone()
     }
 
+    /// Show `dir` without touching the history (start-up, forward/back replay).
     fn re_root(&mut self, dir: PathBuf) {
         self.root = dir;
         self.hidden = None;
@@ -355,6 +535,72 @@ impl App {
         self.needs_rank = true;
         self.selected = 0;
         self.offset = 0;
+        self.hidden_count = None;
+    }
+
+    /// Show `dir` as a *new* stop: the history drops its forward tail and the
+    /// prompt, the listing and the preview all start over (the ported
+    /// `fzf-navigator` navigation, where every move rewrites the history tail).
+    fn navigate(&mut self, dir: PathBuf) {
+        self.history.visit(dir.clone());
+        self.re_root(dir);
+    }
+
+    /// Drop the listing caches so the next draw re-walks the root: used by the
+    /// toggles and by `reload`, which must not keep a stale listing.
+    fn invalidate(&mut self) {
+        self.hidden = None;
+        self.dots = None;
+        self.needs_rank = true;
+        self.selected = 0;
+        self.offset = 0;
+        self.hidden_count = None;
+    }
+
+    /// How many entries the dot rule hides in the current directory: the `-N`
+    /// flag of the status line, ported from the shell version's
+    /// `ls -1A | wc -l` minus its listing count. One readdir, memoised per
+    /// root, so a deep listing never pays for it.
+    fn hidden_entries(&mut self) -> usize {
+        if let Some(n) = self.hidden_count {
+            return n;
+        }
+        let n = std::fs::read_dir(&self.root)
+            .map(|rd| {
+                rd.filter_map(|e| e.ok())
+                    .filter(|e| e.file_name().to_string_lossy().starts_with('.'))
+                    .count()
+            })
+            .unwrap_or(0);
+        self.hidden_count = Some(n);
+        n
+    }
+
+    /// Help overlay rows: the action registry first (so a rebound key is
+    /// reflected immediately), then the fixed built-in keys.
+    fn help_lines(&self) -> Vec<String> {
+        let mut lines = self.keymap.help_rows();
+        lines.push(String::new());
+        for (keys, text) in BUILTIN_HELP {
+            lines.push(format!("{keys:<18}{text}"));
+        }
+        lines
+    }
+
+    fn help_len(&self) -> usize {
+        // help_rows() is rebuilt on demand; the length is stable per keymap.
+        self.keymap.entries().len() + 1 + BUILTIN_HELP.len()
+    }
+
+    /// Keep the help overlay's first visible row inside the scrollable range.
+    fn clamp_help(&mut self) {
+        if !self.help_on {
+            self.help_offset = 0;
+            return;
+        }
+        let rows = self.list_rows().max(1);
+        let max = self.help_len().saturating_sub(rows);
+        self.help_offset = self.help_offset.min(max);
     }
 
     fn move_sel(&mut self, delta: isize) {
@@ -416,7 +662,7 @@ impl App {
         if q.is_empty() {
             let root = std::path::PathBuf::from("/");
             if self.root != root {
-                self.re_root(root);
+                self.navigate(root);
             }
             return;
         }
@@ -441,7 +687,7 @@ impl App {
             }
         }
         if let (Some(path), false) = (cand, dup) {
-            self.re_root(path);
+            self.navigate(path);
             return;
         }
         // not a unique directory: let '/' be typed as an ordinary character
@@ -451,7 +697,7 @@ impl App {
         self.offset = 0;
     }
 
-    /// Open the entry under the cursor: directories re-root the picker, files
+    /// Open the entry under the cursor: directories navigate the picker, files
     /// end it. With marks present every marked path is emitted, in the order
     /// they were marked, one `ACTION<TAB>PATH` line each.
     fn open(&mut self, action: &str) -> io::Result<()> {
@@ -460,7 +706,7 @@ impl App {
         }
         let entry = self.entry_at(self.selected);
         if entry.kind == FileKind::Dir {
-            self.re_root(entry.path(&self.root));
+            self.navigate(entry.path(&self.root));
             return Ok(());
         }
         let paths = self.selection_paths(&entry);
@@ -468,18 +714,204 @@ impl App {
         // terminal buffer (possibly itself inside a web xterm), whose
         // alt-screen emulation is unreliable. The shim deletes the buffer on
         // exit anyway, so clear the frame and print the selection.
-        // clear the panel first, then park the cursor at its first row (right
-        // under the command line) so the selection prints like normal shell
-        // output, not below a gap of erased panel rows
+        let mut so = self.leave()?;
+        write_selection(&mut so, action, &paths)?;
+        store_history(&self.query);
+        std::process::exit(0);
+    }
+
+    /// Print the selection the way `insert_selection` does in the shell
+    /// version: relative to the directory the picker was launched from (not to
+    /// the browsed one), with `./` in front of a bare executable name, so the
+    /// line can be pasted after `cd <launch dir>` unchanged.
+    fn emit_insert(&mut self) -> io::Result<()> {
+        if self.ranked.is_empty() {
+            return Ok(());
+        }
+        let entry = self.entry_at(self.selected);
+        let paths = self.selection_paths(&entry);
+        let items = paths::insert_paths(&paths, self.history.session_start());
+        let mut so = self.leave()?;
+        write_lines(&mut so, "insert", &items)?;
+        store_history(&self.query);
+        std::process::exit(0);
+    }
+
+    /// Emit the locked-mode `cd` target: on `exit` with `L` on, the browsed
+    /// directory is printed as `cd<TAB>PATH` so a wrapper can change the shell
+    /// directory, which is what the shell version does on its `exit` action.
+    /// Without `L` nothing is printed: the picker leaves the cwd alone.
+    fn emit_cd(&mut self) -> io::Result<()> {
+        if !self.locked || *self.history.session_start() == self.root {
+            return Ok(());
+        }
+        let target = self.root.clone();
+        let mut so = self.leave()?;
+        write_selection(&mut so, "cd", &[target])?;
+        Ok(())
+    }
+
+    /// Absolute paths of the selection, shell-quoted, space-joined and put on
+    /// the clipboard through OSC 52 (works over ssh and inside a nvim terminal
+    /// buffer, where `wl-copy` would have no display to talk to).
+    fn copy_selection(&mut self) {
+        if self.ranked.is_empty() {
+            return;
+        }
+        let entry = self.entry_at(self.selected);
+        let paths = self.selection_paths(&entry);
+        let words: Vec<String> = paths
+            .iter()
+            .map(|p| p.to_string_lossy().to_string())
+            .collect();
+        let text = paths::quote_all(&words);
+        let mut out = io::stdout();
+        let _ = out.write_all(osc52(&text).as_bytes());
+        let _ = out.flush();
+        self.notice = Some(format!("copied {} path(s)", words.len()));
+    }
+
+    /// Leave the alternate-free screen: erase the panel, park the cursor on the
+    /// row under the command line, hand the terminal back and return a locked
+    /// stdout for the selection lines.
+    fn leave(&mut self) -> io::Result<io::Stdout> {
         self.clear_panel(&mut io::stdout())?;
         let esc = char::from_u32(0x1b).unwrap();
         write!(io::stdout(), "{esc}[{};1H", self.panel_top() + 1)?;
         terminal::disable_raw_mode()?;
         execute!(io::stdout(), cursor::Show)?;
-        let mut so = io::stdout().lock();
-        write_selection(&mut so, action, &paths)?;
-        store_history(&self.query);
-        std::process::exit(0);
+        Ok(io::stdout())
+    }
+
+    /// Run one registry action. `Some(code)` ends the event loop with that exit
+    /// code; `None` keeps the picker running (and redraws).
+    fn on_action(&mut self, action: Action) -> io::Result<Option<i32>> {
+        match action {
+            Action::Open => self.open("edit")?,
+            Action::OpenTab => self.open("tabedit")?,
+            Action::OpenSplit => self.open("split")?,
+            Action::OpenVSplit => self.open("vsplit")?,
+            Action::InsertSelection => self.emit_insert()?,
+            Action::CopySelection => self.copy_selection(),
+            Action::Exit => {
+                self.emit_cd()?;
+                return Ok(Some(0));
+            }
+            Action::Cancel => {
+                // Ported `cancel`: the first Esc walks back to the session
+                // start, only an Esc taken there leaves the picker.
+                if self.root == *self.history.session_start() {
+                    return Ok(Some(1));
+                }
+                let start = self.history.session_start().to_path_buf();
+                self.history.to_session_start();
+                self.re_root(start);
+            }
+            Action::GoToParent => {
+                if let Some(parent) = self.root.parent() {
+                    if parent != self.root {
+                        self.navigate(parent.to_path_buf());
+                    }
+                }
+            }
+            Action::GoBack => {
+                if let Some(dir) = self.history.back().map(Path::to_path_buf) {
+                    self.re_root(dir);
+                }
+            }
+            Action::GoForward => {
+                if let Some(dir) = self.history.forward().map(Path::to_path_buf) {
+                    self.re_root(dir);
+                }
+            }
+            Action::GoToSessionStart => {
+                let start = self.history.session_start().to_path_buf();
+                self.navigate(start);
+            }
+            Action::GoHome => {
+                if let Some(home) = std::env::var_os("HOME") {
+                    self.navigate(PathBuf::from(home));
+                }
+            }
+            Action::Descend => self.slash_enter(),
+            Action::ToggleHidden => {
+                self.dots_on = !self.dots_on;
+                // Both listings stay cached; only the index has to be rebuilt.
+                self.needs_rank = true;
+                self.selected = 0;
+                self.offset = 0;
+                self.hidden_count = None;
+                self.notice = Some(if self.dots_on {
+                    "hidden files: on".to_string()
+                } else {
+                    "hidden files: off".to_string()
+                });
+            }
+            Action::ToggleSkipped => {
+                self.skipped_on = !self.skipped_on;
+                self.opts.skip_dirs = if self.skipped_on {
+                    self.skip_spec.clone()
+                } else {
+                    Vec::new()
+                };
+                self.invalidate();
+                self.notice = Some(if self.skipped_on {
+                    "skip dirs: on".to_string()
+                } else {
+                    "skip dirs: off".to_string()
+                });
+            }
+            Action::ToggleLocked => {
+                self.locked = !self.locked;
+                self.notice = Some(if self.locked {
+                    "locked: paths anchored at the launch dir".to_string()
+                } else {
+                    "unlocked".to_string()
+                });
+            }
+            Action::ToggleRecentFirst => {
+                self.sort_mode = if self.sort_mode == 3 { 0 } else { 3 };
+                self.invalidate();
+            }
+            Action::TogglePreview => {
+                self.preview_on = !self.preview_on;
+                self.clear_pane();
+            }
+            Action::CycleView => self.view = self.view.next(),
+            Action::CycleSort => {
+                self.sort_mode = (self.sort_mode + 1) % 4;
+                self.invalidate();
+            }
+            Action::CycleDepth => {
+                self.opts.depth = self.opts.depth % 6 + 1;
+                self.invalidate();
+            }
+            Action::Mark => self.toggle_mark(),
+            Action::Reload => {
+                self.invalidate();
+                self.notice = Some("reloaded".to_string());
+            }
+            Action::Redraw => {
+                // `C-l` repaints, the terminal-canonical meaning. Erase the
+                // panel (and any placed image) so the next `draw` writes the
+                // frame onto a clean area: leftovers after a resize or a stray
+                // print disappear, nothing else changes.
+                let _ = self.clear_panel(&mut io::stdout());
+                self.kitty_drawn = false;
+                self.kitty_key = None;
+                self.notice = Some("redrawn".to_string());
+            }
+            Action::ToggleHelp => {
+                self.help_on = !self.help_on;
+                self.help_offset = 0;
+                self.compute_box();
+                let h = self.size.1;
+                if self.pop_top + self.box_h > h {
+                    self.pop_top = h.saturating_sub(self.box_h);
+                }
+            }
+        }
+        Ok(None)
     }
 
     pub fn run(&mut self) -> io::Result<i32> {
@@ -648,6 +1080,15 @@ impl App {
         let outer_h = match self.ui_rows {
             Some(r) => r.clamp(4, 200).min(h),
             None => OUTER_ROWS.min(h),
+        };
+        // The help overlay needs one row per action plus the built-in block:
+        // grow the box for it (never past the terminal), and shrink back when
+        // the overlay closes, so `?` is a real help screen and not a teaser
+        // clipped to five rows.
+        let outer_h = if self.help_on {
+            outer_h.max((self.help_len() + 3).min(h))
+        } else {
+            outer_h
         };
         self.box_h = outer_h.max(1);
         let outer_w = match self.ui_width {
@@ -890,13 +1331,69 @@ impl App {
                         code, modifiers, ..
                     }) => {
                         let ctrl = modifiers.contains(KeyModifiers::CONTROL);
+                        let Some(key) = key_from_event(code, modifiers) else {
+                            self.clamp_offset(self.list_rows());
+                            break;
+                        };
+                        // The help overlay is modal for movement only: it
+                        // scrolls with the navigation keys and any other press
+                        // closes it first (Esc and `?` only close it).
+                        if self.help_on {
+                            let page = self.list_rows().max(1) as isize;
+                            let scroll = match key {
+                                k if k == Key::named(NamedKey::Down)
+                                    || k == Key::ch('n').with_ctrl(true) =>
+                                {
+                                    Some(1isize)
+                                }
+                                k if k == Key::named(NamedKey::Up)
+                                    || k == Key::ch('p').with_ctrl(true) =>
+                                {
+                                    Some(-1isize)
+                                }
+                                k if k == Key::named(NamedKey::PageDown) => Some(page),
+                                k if k == Key::named(NamedKey::PageUp) => Some(-page),
+                                k if k == Key::named(NamedKey::Home) => Some(isize::MIN / 2),
+                                k if k == Key::named(NamedKey::End) => Some(isize::MAX / 2),
+                                _ => None,
+                            };
+                            if let Some(delta) = scroll {
+                                let last = self.help_len().saturating_sub(1) as isize;
+                                self.help_offset =
+                                    (self.help_offset as isize + delta).clamp(0, last) as usize;
+                                self.clamp_help();
+                                self.clamp_offset(self.list_rows());
+                                break;
+                            }
+                            let closes_only = matches!(
+                                self.keymap.action_of(key),
+                                Some(Action::Cancel) | Some(Action::ToggleHelp)
+                            );
+                            self.help_on = false;
+                            self.help_offset = 0;
+                            self.compute_box();
+                            let h = self.size.1;
+                            if self.pop_top + self.box_h > h {
+                                self.pop_top = h.saturating_sub(self.box_h);
+                            }
+                            if closes_only {
+                                self.clamp_offset(self.list_rows());
+                                break;
+                            }
+                        }
+                        // Registry first: a bound key owns its press. Printable
+                        // browse-mode keys (`/`, `[`, `\`, `?`) hand it back to
+                        // the prompt once it has text — see `route_key`.
+                        let action = route_key(&self.keymap, key, &self.query);
+                        if let Some(action) = action {
+                            if let Some(code) = self.on_action(action)? {
+                                return Ok(code);
+                            }
+                            self.clamp_offset(self.list_rows());
+                            self.clamp_help();
+                            break;
+                        }
                         match (code, ctrl) {
-                            (KeyCode::Esc, _) => return Ok(1),
-                            (KeyCode::Char('c' | 'g'), true) => return Ok(1),
-                            (KeyCode::Enter | KeyCode::Tab, _) => self.open("edit")?,
-                            (KeyCode::Char('t'), true) => self.open("tabedit")?,
-                            (KeyCode::Char('o'), true) => self.open("split")?,
-                            (KeyCode::Char('v'), true) => self.open("vsplit")?,
                             (KeyCode::Char('n'), true)
                             | (KeyCode::Char('j'), true)
                             | (KeyCode::Down, _) => {
@@ -926,24 +1423,9 @@ impl App {
                                     self.offset = 0;
                                 } else if let Some(parent) = self.root.parent() {
                                     if parent != self.root {
-                                        self.re_root(parent.to_path_buf());
+                                        self.navigate(parent.to_path_buf());
                                     }
                                 }
-                            }
-                            // C-l cycles the entry layout list -> grid -> long.
-                            (KeyCode::Char('l'), true) => self.view = self.view.next(),
-                            // C-x marks the cursor entry (and steps down) so
-                            // Enter can open several files at once.
-                            (KeyCode::Char('x'), true) => self.toggle_mark(),
-                            // C-y cycles the sort order like the nvim float: drop
-                            // the cached listing so the next draw re-sorts it.
-                            (KeyCode::Char('y'), true) => {
-                                self.sort_mode = (self.sort_mode + 1) % 4;
-                                self.hidden = None;
-                                self.dots = None;
-                                self.needs_rank = true;
-                                self.selected = 0;
-                                self.offset = 0;
                             }
                             (KeyCode::Char('u'), true) => {
                                 if !self.query.is_empty() {
@@ -951,17 +1433,6 @@ impl App {
                                     self.needs_rank = true;
                                     self.selected = 0;
                                 }
-                            }
-                            // C-d cycles the search depth (1..6) like the nvim
-                            // float; the listing cache is keyed by depth, so the
-                            // next draw re-lists (or hits that depth's cache).
-                            (KeyCode::Char('d'), true) => {
-                                self.opts.depth = self.opts.depth % 6 + 1;
-                                self.hidden = None;
-                                self.dots = None;
-                                self.needs_rank = true;
-                                self.selected = 0;
-                                self.offset = 0;
                             }
                             // readline-ish: C-h = backspace, Home/End = first/last,
                             // PgUp/PgDn = one page of the grid
@@ -1002,15 +1473,9 @@ impl App {
                                     self.selected = 0;
                                 }
                             }
-                            (KeyCode::Char('/'), false) => self.slash_enter(),
-                            // Right preview pane: C-Space (NUL) or Shift+P toggles.
-                            (KeyCode::Char(' '), true) | (KeyCode::Char('P'), false) => {
-                                self.preview_on = !self.preview_on;
-                                self.clear_pane();
-                            }
                             (KeyCode::Char(c), false) => {
-                                if let Some(c) = normalize_query_char(c) {
-                                    self.query.push(c);
+                                let changed = type_into(&mut self.query, c);
+                                if changed {
                                     self.needs_rank = true;
                                     self.selected = 0;
                                 }
@@ -1075,6 +1540,20 @@ impl App {
         if self.preview_on {
             self.refresh_pane();
         }
+        // `-N`: one readdir per root, memoised, so the flag costs nothing on a
+        // deep tree (the counting listing itself would cost a full walk).
+        self.hidden_shown = if self.show_dots() {
+            0
+        } else {
+            self.hidden_entries()
+        };
+        // The overlay replaces the entries, so it also replaces the long-view
+        // header that belongs to them.
+        let help: Option<Vec<String>> = if self.help_on {
+            Some(self.help_lines())
+        } else {
+            None
+        };
         let root_path = self.root.clone();
         let esc = char::from_u32(0x1b).unwrap();
         let w = self.box_w;
@@ -1105,7 +1584,7 @@ impl App {
         // Content rows: entry grid on top, prompt as the bottom line. The long
         // view spends its first content row on a column header that uses the
         // same field widths as the rows, so the entries start one row lower.
-        let long_header = if self.shows_long_header() {
+        let long_header = if self.shows_long_header() && help.is_none() {
             lusty_core::listing::meta_header(self.cols_mask)
         } else {
             None
@@ -1121,7 +1600,17 @@ impl App {
                 Some(_) => r.checked_sub(1),
                 None => Some(r),
             };
-            if header_row {
+            if let Some(help_rows) = &help {
+                // One help line per screen row, scrolled by `help_offset`.
+                // The keys column keeps the shell version's padding, so the
+                // descriptions line up like they do in its footer.
+                if let Some(text) = help_rows.get(self.help_offset + r) {
+                    line.push_str(&format!("{esc}[{DIM_FG}m"));
+                    line.push_str(&sanitize_display(text));
+                    line.push_str(&revert);
+                }
+                self.close_row(&mut frame, &mut line, r, esc, lw, w);
+            } else if header_row {
                 let h = long_header.as_deref().unwrap_or_default();
                 // One space for the mark column, so NAME lines up with the
                 // labels below.
@@ -1184,7 +1673,35 @@ impl App {
                                 cell.push_str(&format!("{esc}[{code}m"));
                             }
                             if self.icons {
+                                // Truecolor icon: the glyph takes the colour of
+                                // its extension from theme.yml. On the cursor
+                                // row it keeps the selection foreground — the
+                                // contrast floor is asserted for the selection
+                                // text, and a decorative tint must not repaint
+                                // over it.
+                                let tint = if selected {
+                                    None
+                                } else {
+                                    self.icon_rgb(e.basename(), e.kind)
+                                };
+                                if let Some([r, g, b]) = tint {
+                                    cell.push_str(&format!("{esc}[38;2;{r};{g};{b}m"));
+                                }
                                 cell.push_str(icon_for(&e));
+                                if tint.is_some() {
+                                    // Back to the palette colour of the name,
+                                    // or to the terminal default.
+                                    match self.palette.code_for(
+                                        e.basename(),
+                                        e.kind,
+                                        is_exec(&e.path(&root_path)),
+                                    ) {
+                                        Some(code) if !selected => {
+                                            cell.push_str(&format!("{esc}[{code}m"));
+                                        }
+                                        _ => cell.push_str(&format!("{esc}[39m")),
+                                    }
+                                }
                                 cell.push(' ');
                             }
                             // Terminal-safe display copy: a crafted file name
@@ -1289,6 +1806,16 @@ impl App {
         out.flush()
     }
 
+    /// Icon colour of a visible row. Directories and links keep the colour the
+    /// LS_COLORS palette already gave their name; files take the per-extension
+    /// foreground from `theme.yml` (see [`lusty_core::icon_theme`]).
+    fn icon_rgb(&self, name: &str, kind: FileKind) -> Option<[u8; 3]> {
+        if kind != FileKind::File {
+            return None;
+        }
+        self.icon_theme.as_ref().and_then(|t| t.color_for(name))
+    }
+
     fn prompt_line(&self) -> String {
         let esc = char::from_u32(0x1b).unwrap();
         let mut out = String::new();
@@ -1308,37 +1835,42 @@ impl App {
             out.push('m');
             out.push_str(text);
         };
-        let mut path = self.root.display().to_string();
-        if let Ok(home) = std::env::var("HOME") {
-            let home = home.trim_end_matches('/');
-            if !home.is_empty() && path.starts_with(home) {
-                let rest = &path[home.len()..];
-                // Only a component boundary counts: with HOME=/home/neg the
-                // path /home/negwork must not become ~work.
-                if rest.is_empty() {
-                    path = "~".to_string();
-                } else if rest.starts_with('/') {
-                    path = format!("~{rest}");
+        // Path, in the shell version's shape: the directory the picker was
+        // launched from is the anchor, the browsed subpath follows after `>`
+        // (`*>` when the current directory is an ancestor of the start or on a
+        // fork). At the start directory the prompt is just that path.
+        let home = std::env::var("HOME").unwrap_or_default();
+        let start = paths::tildify(&self.history.session_start().display().to_string(), &home);
+        let current = paths::tildify(&self.root.display().to_string(), &home);
+        let pp = paths::prompt_path(&start, &current);
+        let paint_components = |text: &str, out: &mut String| {
+            let text = sanitize_display(text);
+            let mut part = String::new();
+            for ch in text.chars() {
+                if ch == '/' {
+                    push_painted(&part, "38;2;149;167;188", out);
+                    push_painted("/", "38;2;0;95;175", out);
+                    part.clear();
+                } else {
+                    part.push(ch);
                 }
             }
-        }
-        if let Some(rest) = path.strip_prefix('~') {
-            push_painted("~", "38;2;40;115;115", &mut out);
-            path = rest.to_string();
-        }
-        let path = sanitize_display(&path);
-        let mut current = String::new();
-        for ch in path.chars() {
-            if ch == '/' {
-                push_painted(&current, "38;2;149;167;188", &mut out);
-                push_painted("/", "38;2;0;95;175", &mut out);
-                current.clear();
-            } else {
-                current.push(ch);
+            push_painted(&part, "38;2;149;167;188", out);
+        };
+        match pp.anchor.strip_prefix('~') {
+            Some(rest) => {
+                push_painted("~", "38;2;40;115;115", &mut out);
+                paint_components(rest, &mut out);
             }
+            None => paint_components(&pp.anchor, &mut out),
         }
-        push_painted(&current, "38;2;149;167;188", &mut out);
-        push_painted(" \u{f105} ", "38;2;0;95;175", &mut out);
+        let separator = match pp.rel {
+            paths::PromptRel::Same => " \u{f105} ",
+            paths::PromptRel::Child => " > ",
+            paths::PromptRel::Ancestor | paths::PromptRel::Fork => " *> ",
+        };
+        push_painted(separator, "38;2;0;95;175", &mut out);
+        paint_components(&pp.subpath, &mut out);
         push_painted(&self.query, "1;38;2;255;255;255", &mut out);
         // Search depth (C-d cycles it) and the matched/total counter, dimmed
         // like the border.
@@ -1356,6 +1888,38 @@ impl App {
         // of the filter counter.
         if !self.marked.is_empty() {
             push_painted(&format!("  +{}", self.marked.len()), DIM_FG, &mut out);
+        }
+        // Status flags, ported from the shell version's info line: H hidden
+        // files, I skipped dirs are being walked, L locked, R newest-first,
+        // and `-N` for the entries the dot rule hides in this directory. Each
+        // flag is a letter, not a colour, so the state survives a monochrome
+        // terminal.
+        let mut flags = String::new();
+        if self.dots_on {
+            flags.push('H');
+        }
+        if !self.skipped_on {
+            flags.push('I');
+        }
+        if self.locked {
+            flags.push('L');
+        }
+        if self.sort_mode == 3 {
+            flags.push('R');
+        }
+        if !self.show_dots() && self.hidden_shown > 0 {
+            if !flags.is_empty() {
+                flags.push(' ');
+            }
+            flags.push_str(&format!("-{}", self.hidden_shown));
+        }
+        if !flags.is_empty() {
+            push_painted(&format!("  {flags}"), DIM_FG, &mut out);
+        }
+        // One-shot feedback for actions that leave no other trace (copy,
+        // reload, toggles): cleared on the next key press.
+        if let Some(notice) = &self.notice {
+            push_painted(&format!("  {notice}"), "38;2;209;229;255", &mut out);
         }
         out.push(esc);
         out.push_str("[22;23;24;39m");
@@ -1793,7 +2357,7 @@ mod pane_test {
         dir
     }
 
-    fn app_for(dir: &std::path::Path) -> App {
+    pub(super) fn app_for(dir: &std::path::Path) -> App {
         let opts = Options {
             depth: 1,
             skip_dirs: vec![],
@@ -2021,7 +2585,7 @@ mod view_test {
 
     /// Escapes of a rendered frame, minus the `ESC[<row>;1H` cursor moves:
     /// the result is one raw string per visual row, styling intact.
-    fn frame_parts(app: &mut App) -> Vec<String> {
+    pub(super) fn frame_parts(app: &mut App) -> Vec<String> {
         let mut buf: Vec<u8> = Vec::new();
         app.draw(&mut buf).expect("render into a buffer");
         let text = String::from_utf8_lossy(&buf);
@@ -2061,12 +2625,12 @@ mod view_test {
     }
 
     /// Frame rows with the styling stripped.
-    fn frame_rows(app: &mut App) -> Vec<String> {
+    pub(super) fn frame_rows(app: &mut App) -> Vec<String> {
         frame_parts(app).iter().map(|r| plain(r)).collect()
     }
 
     /// Text of `s` with every SGR/erase escape dropped.
-    fn plain(s: &str) -> String {
+    pub(super) fn plain(s: &str) -> String {
         let esc = char::from_u32(0x1b).unwrap();
         let mut out = String::new();
         let mut chars = s.chars();
@@ -2571,5 +3135,357 @@ mod width_test {
         let s = "\x1b[7;3R\x1b[24;80R";
         let replies: Vec<(usize, usize)> = s.split('R').filter_map(parse_dsr).collect();
         assert_eq!(replies, vec![(7, 3), (24, 80)]);
+    }
+}
+
+/// Ported-from-`fzf-navigator` behaviour: key routing (so `,`, `.`, `/` stay
+/// typeable), directory history, browse-mode toggles, status flags and the `?`
+/// overlay.
+#[cfg(test)]
+mod ported_test {
+    use super::pane_test::app_for;
+    use super::view_test::{frame_rows, plain};
+    use super::*;
+
+    // --- ported from fzf-navigator: key routing and browse state ---
+
+    /// An App on a real directory, without the preview pane (so the tests do
+    /// not spawn render threads) and with a small, deterministic box.
+    fn quiet_app(dir: &std::path::Path) -> App {
+        let mut app = app_for(dir);
+        app.preview_on = false;
+        app.clear_pane();
+        app
+    }
+
+    fn nav_fixture(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("lusty_nav_{tag}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        std::fs::write(dir.join("file.txt"), b"x").unwrap();
+        std::fs::write(dir.join(".hidden"), b"x").unwrap();
+        dir
+    }
+
+    /// `,` and `.` are plain text and must never be turned into anything else;
+    /// `/` is the descend key and types itself only inside `slash_enter`.
+    #[test]
+    fn comma_dot_and_slash_reach_the_prompt() {
+        let km = Keymap::defaults();
+        for c in [',', '.', ':', ';', '-', '_', '@', ' '] {
+            assert_eq!(route_key(&km, Key::ch(c), ""), None, "{c:?} must type");
+            assert_eq!(route_key(&km, Key::ch(c), "ab"), None, "{c:?} must type");
+        }
+        assert_eq!(
+            normalize_query_char(','),
+            Some(','),
+            "the RU `б` key keeps the comma"
+        );
+        assert_eq!(normalize_query_char('.'), Some('.'));
+        assert_eq!(
+            route_key(&km, Key::ch('/'), ""),
+            Some(Action::Descend),
+            "/ is the descend key on an empty prompt"
+        );
+        assert_eq!(
+            route_key(&km, Key::ch('/'), "ab"),
+            Some(Action::Descend),
+            "/ decides for itself whether it descends or types a slash"
+        );
+        // And the descend path really types a literal slash when it cannot
+        // descend into anything: `,`/`.`/`/` never collapse into each other.
+        let dir = nav_fixture("slash");
+        let mut app = quiet_app(&dir);
+        app.set_query("file.txt");
+        app.ensure_ranked();
+        app.slash_enter();
+        assert_eq!(app.query, "file.txt/", "no unique dir: the slash is typed");
+        app.set_query("sub");
+        app.ensure_ranked();
+        app.slash_enter();
+        assert_eq!(app.root, dir.join("sub"), "a unique prefix descends");
+    }
+
+    /// The ported browse keys are shadows of real characters: they act while
+    /// the prompt is empty and step aside once there is text to extend.
+    #[test]
+    fn printable_action_keys_type_once_the_prompt_has_text() {
+        let km = Keymap::defaults();
+        for (spec, action) in [
+            ("[", Action::GoToSessionStart),
+            ("\\", Action::GoHome),
+            ("?", Action::ToggleHelp),
+        ] {
+            let key = Key::parse(spec).unwrap();
+            assert_eq!(route_key(&km, key, ""), Some(action), "{spec} when empty");
+            assert_eq!(
+                route_key(&km, key, "q"),
+                None,
+                "{spec} must type after text"
+            );
+        }
+    }
+
+    /// Modified and named keys keep their action regardless of the query.
+    #[test]
+    fn modified_keys_always_reach_their_action() {
+        let km = Keymap::defaults();
+        for (spec, action) in [
+            ("alt-p", Action::TogglePreview),
+            ("ctrl-r", Action::Reload),
+            ("ctrl-x", Action::Mark),
+            ("alt-h", Action::ToggleHidden),
+            ("alt-y", Action::CopySelection),
+            ("ctrl-alt-o", Action::GoBack),
+            ("enter", Action::Open),
+            ("esc", Action::Cancel),
+        ] {
+            let key = Key::parse(spec).unwrap();
+            assert_eq!(route_key(&km, key, ""), Some(action), "{spec} when empty");
+            assert_eq!(
+                route_key(&km, key, "typed"),
+                Some(action),
+                "{spec} keeps working mid-query"
+            );
+        }
+    }
+
+    #[test]
+    fn cancel_walks_back_to_the_session_start_before_leaving() {
+        let dir = nav_fixture("cancel");
+        let mut app = quiet_app(&dir);
+        app.navigate(dir.join("sub"));
+        assert_eq!(app.history.len(), 2);
+        // The first Esc is a jump back, not an exit.
+        assert_eq!(app.on_action(Action::Cancel).unwrap(), None);
+        assert_eq!(app.root, dir);
+        // The second one, on the start directory, leaves with exit code 1.
+        assert_eq!(app.on_action(Action::Cancel).unwrap(), Some(1));
+    }
+
+    #[test]
+    fn back_and_forward_replay_the_directory_history() {
+        let dir = nav_fixture("backfwd");
+        let mut app = quiet_app(&dir);
+        app.navigate(dir.join("sub"));
+        assert_eq!(app.on_action(Action::GoBack).unwrap(), None);
+        assert_eq!(app.root, dir);
+        assert!(app.on_action(Action::GoBack).unwrap().is_none());
+        assert_eq!(app.root, dir, "no wrap-around at the oldest entry");
+        app.on_action(Action::GoForward).unwrap();
+        assert_eq!(app.root, dir.join("sub"));
+    }
+
+    #[test]
+    fn the_toggles_flip_the_listing_state() {
+        let dir = nav_fixture("flags");
+        let mut app = quiet_app(&dir);
+        assert!(!app.show_dots());
+        app.on_action(Action::ToggleHidden).unwrap();
+        assert!(app.show_dots(), "H shows hidden files without a dot query");
+        app.on_action(Action::ToggleSkipped).unwrap();
+        assert!(app.opts.skip_dirs.is_empty(), "I walks the skipped dirs");
+        app.on_action(Action::ToggleSkipped).unwrap();
+        app.on_action(Action::ToggleRecentFirst).unwrap();
+        assert_eq!(app.sort_mode, 3, "R is the newest-first order");
+        app.on_action(Action::ToggleLocked).unwrap();
+        assert!(app.locked);
+        app.on_action(Action::Reload).unwrap();
+        assert_eq!(app.notice.as_deref(), Some("reloaded"));
+    }
+
+    #[test]
+    fn the_prompt_reports_the_ported_flags() {
+        let dir = nav_fixture("promptflags");
+        let mut app = quiet_app(&dir);
+        // The draw pass computes the `-N` counter; nothing else does.
+        let _ = frame_rows(&mut app);
+        let text = plain(&app.prompt_line());
+        assert!(
+            text.contains("-1"),
+            "the dot rule hides `.hidden`, so -1 must show: {text}"
+        );
+        app.on_action(Action::ToggleHidden).unwrap();
+        app.on_action(Action::ToggleSkipped).unwrap();
+        app.on_action(Action::ToggleLocked).unwrap();
+        app.on_action(Action::ToggleRecentFirst).unwrap();
+        let _ = frame_rows(&mut app);
+        let text = plain(&app.prompt_line());
+        for flag in ["H", "I", "L", "R"] {
+            assert!(text.contains(flag), "flag {flag} missing from {text}");
+        }
+        assert!(
+            !text.contains("-1"),
+            "with H on nothing is hidden any more: {text}"
+        );
+    }
+
+    #[test]
+    fn the_help_overlay_lists_the_keymap_and_grows_the_box() {
+        let dir = nav_fixture("help");
+        let mut app = quiet_app(&dir);
+        app.set_ui(Some(8), Some(80));
+        app.compute_box();
+        let before = app.box_h;
+        app.on_action(Action::ToggleHelp).unwrap();
+        assert!(app.help_on);
+        assert!(
+            app.box_h > before,
+            "the overlay needs room for every action: {before} -> {}",
+            app.box_h
+        );
+        let frame = frame_rows(&mut app).join("\n");
+        assert!(
+            frame.contains("enter, tab") && frame.contains("open: enter a directory"),
+            "{frame}"
+        );
+        // The tail of the list — the last action and the built-in block — is a
+        // scroll away, not cut off: the overlay is scrollable.
+        app.help_offset = app.help_len();
+        app.clamp_help();
+        let frame = frame_rows(&mut app).join("\n");
+        assert!(
+            frame.contains("toggle this help"),
+            "last action row: {frame}"
+        );
+        assert!(frame.contains("type into the prompt"), "built-ins: {frame}");
+        // The help is the keymap: a rebind shows up on the next frame.
+        app.set_keys("alt-z=toggle_help");
+        let frame = frame_rows(&mut app).join("\n");
+        assert!(frame.contains("alt-z"), "rebound key missing: {frame}");
+        // `?` closes it and the box shrinks back to the configured height.
+        app.on_action(Action::ToggleHelp).unwrap();
+        assert!(!app.help_on);
+        assert_eq!(app.box_h, before);
+    }
+
+    /// The real input chain, press by press: crossterm event → key → routing →
+    /// prompt. This is what the terminal smoke would do, minus the terminal.
+    #[test]
+    fn the_input_chain_keeps_comma_dot_and_slash_intact() {
+        let km = Keymap::defaults();
+        let mut query = String::new();
+        let press = |query: &mut String, ch: char| {
+            let key = key_from_event(KeyCode::Char(ch), KeyModifiers::NONE).unwrap();
+            match route_key(&km, key, query) {
+                Some(action) => action,
+                None => {
+                    assert!(type_into(query, ch), "{ch:?} must reach the prompt");
+                    Action::Reload // any action: nothing ran
+                }
+            }
+        };
+        // `,` and `.` type, and RU `б`/`ю` land on the same two characters.
+        for ch in [',', '.'] {
+            assert_eq!(press(&mut query, ch), Action::Reload, "{ch:?} typed");
+        }
+        assert_eq!(query, ",.");
+        assert!(type_into(&mut query, 'б'));
+        assert!(type_into(&mut query, 'ю'));
+        assert!(type_into(&mut query, 'х'), "RU `х` is the [ key");
+        assert_eq!(query, ",.,.[", "RU б/ю/х keep comma, dot and bracket");
+        // `/` is routed to the descend action even with text, and `slash_enter`
+        // is what turns it into a literal slash when nothing descends.
+        let slash = key_from_event(KeyCode::Char('/'), KeyModifiers::NONE).unwrap();
+        assert_eq!(route_key(&km, slash, &query), Some(Action::Descend));
+        // Modified keys never get typed, whatever the query holds.
+        let ctrl_r = key_from_event(KeyCode::Char('r'), KeyModifiers::CONTROL).unwrap();
+        assert_eq!(route_key(&km, ctrl_r, &query), Some(Action::Reload));
+        assert!(!is_printable(ctrl_r));
+        // A NUL byte (ctrl-space) is the exit key, not a character.
+        let nul = key_from_event(KeyCode::Char('\0'), KeyModifiers::CONTROL).unwrap();
+        assert_eq!(route_key(&km, nul, ""), Some(Action::Exit));
+        assert_eq!(nul.char(), None);
+        // Shift folds into the character, so `P` is a plain printable key.
+        let shift_p = key_from_event(KeyCode::Char('P'), KeyModifiers::SHIFT).unwrap();
+        assert_eq!(shift_p.char(), Some('P'));
+        assert_eq!(route_key(&km, shift_p, ""), None, "P must be typeable");
+    }
+
+    /// Whatever reached the query is painted verbatim: the prompt must not
+    /// rewrite `,`/`.`/`/` into something else on the way to the screen.
+    #[test]
+    fn the_prompt_paints_the_query_verbatim() {
+        let dir = nav_fixture("promptpaint");
+        let mut app = quiet_app(&dir);
+        app.set_query("a,b./c,d");
+        let text = plain(&app.prompt_line());
+        assert!(text.contains("a,b./c,d"), "prompt lost characters: {text}");
+        let frame = frame_rows(&mut app).join("\n");
+        assert!(frame.contains("a,b./c,d"), "frame lost characters: {frame}");
+    }
+
+    /// The prompt says where you are *relative to the launch directory*, the
+    /// way the shell version's prompt does: anchor, `>` and the subpath, with
+    /// `*` when the launch directory sits below the current one.
+    #[test]
+    fn the_prompt_names_the_launch_anchor_and_the_browsed_subpath() {
+        let dir = nav_fixture("anchor");
+        let start = dir.clone();
+        let mut app = quiet_app(&dir);
+        let text = plain(&app.prompt_line());
+        assert!(!text.contains('>'), "no separator at the start dir: {text}");
+
+        app.navigate(start.join("sub"));
+        let text = plain(&app.prompt_line());
+        assert!(text.contains(" > sub"), "anchored subpath: {text}");
+        assert!(!text.contains("sub/sub"));
+
+        app.navigate(start.parent().unwrap().to_path_buf());
+        let text = plain(&app.prompt_line());
+        assert!(text.contains("*>"), "the launch dir is below: {text}");
+        assert!(
+            text.contains("anchor"),
+            "the subpath names the launch dir: {text}"
+        );
+    }
+
+    /// Icon colours come from `theme.yml`, but a decorative tint must never
+    /// land on the cursor row: the selection's own foreground is the one the
+    /// WCAG floor is computed for.
+    #[test]
+    fn the_icon_tint_skips_the_cursor_row() {
+        let dir = std::env::temp_dir().join(format!("lusty_icons_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.rs"), b"fn main() {}\n").unwrap();
+        std::fs::write(dir.join("z.txt"), b"text\n").unwrap();
+        let mut app = quiet_app(&dir);
+        app.icons = true;
+        app.set_ui(Some(8), Some(80));
+        app.compute_box();
+        app.ensure_ranked();
+        let rows = super::view_test::frame_parts(&mut app);
+        let row_of = |needle: &str| {
+            rows.iter()
+                .find(|r| plain(r).contains(needle))
+                .unwrap_or_else(|| panic!("no row with {needle}"))
+                .clone()
+        };
+        // `a.rs` is the cursor row (name order) and keeps the selection colour.
+        let selected = row_of("a.rs");
+        assert!(
+            !selected.contains("38;2;222;165;132"),
+            "the rust icon tint must not repaint the cursor row: {selected:?}"
+        );
+        // The other row shows its own extension colour.
+        let other = row_of("z.txt");
+        assert!(
+            other.contains("38;2;137;224;81"),
+            "z.txt should wear its theme colour: {other:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn base64_feeds_the_osc52_clipboard_payload() {
+        assert_eq!(base64(b""), "");
+        assert_eq!(base64(b"f"), "Zg==");
+        assert_eq!(base64(b"fo"), "Zm8=");
+        assert_eq!(base64(b"foo"), "Zm9v");
+        assert_eq!(base64(b"foob"), "Zm9vYg==");
+        assert_eq!(base64(b"fooba"), "Zm9vYmE=");
+        assert_eq!(base64(b"foobar"), "Zm9vYmFy");
+        assert!(osc52("a b").starts_with("\u{1b}]52;c;"));
     }
 }
