@@ -30,7 +30,9 @@ parallel walker, LS_COLORS coloring and metadata views.
   request, fetched only for visible rows), `C-y` cycles the sort order,
   `C-s`/sort keys follow the config, `C-Space` marks files (multi-select),
   `C-r` toggles the preview pane (file content / git diff / man / colour chafa
-  art via SGR→extmarks)
+  art via SGR→extmarks). These are the float's own keys — the standalone picker
+  below uses `alt-v`, `alt-p` and `alt-l` for the same toggles, because `C-l`
+  and `C-r` keep their terminal meanings there.
 - Frecency-aware empty query: the client ships its open-frequency journal with
   `F` records and the listing puts the higher-scored paths first inside each
   depth level (disable with `LUSTY_FRECENCY=0` / `g:LustyExplorerFrecency=0`)
@@ -50,14 +52,25 @@ Nix: `nix build .#lusty` (via `default.nix`,
 lusty [root] [--depth N] [--skip a,b] [--rows N] [--width N]
             [--view list|grid|long] [--sort name|ext|size|time] [--reverse]
             [--dirs-first] [--columns perm,user,size,time]
+            [--icons] [--query Q] [--locked] [--show-hidden]
+            [--keys key=action,...]
 ```
 
 Enter/Tab opens, C-t/C-o/C-v open in tabs/splits, C-n/C-p move, C-u clears,
-Esc/C-c/C-g cancels, C-l cycles the layout (list → grid → long; `--view` or
-`LUSTY_VIEW` picks the start, `--long` is an alias for `--view long`), C-y
-cycles the sort order
+`alt-v` cycles the layout (list → grid → long; `--view` or `LUSTY_VIEW` picks
+the start, `--long` is an alias for `--view long`), C-y cycles the sort order
 (name/ext/size/time; `--sort` picks the starting order), C-d cycles the search
-depth (1..6). The last typed query is restored on the next run.
+depth (1..6), C-l repaints the picker, `alt-p` toggles the preview pane.
+Esc/C-c/C-g walk back to the directory
+the picker was launched from and only leave the picker when pressed there
+(`--locked` starts in locked mode). The last typed query is restored on the
+next run.
+
+The browse-mode keys — history, parent/home/root jumps, `H`/`I`/`L`/`R`
+toggles, `?` help, path insertion and clipboard copy — are ported from
+[fzf-navigator](https://github.com/benward2301/fzf-navigator); see
+[Browse mode](#browse-mode-ported-from-fzf-navigator) for the key table, the
+invariants behind it and `LUSTY_KEYS` remapping.
 
 C-x marks the entry under the cursor and steps to the next one. Marks survive
 re-filtering, sorting and re-rooting; the prompt shows `+N`, and Enter then
@@ -77,6 +90,99 @@ A window with a single entry row (`--rows 4`) becomes a horizontal strip in
 every mode: `list` and `long` drop the meta columns and the header there
 instead of showing one result at a time. The meta columns return with two
 entry rows, the header with three.
+
+## Browse mode (ported from fzf-navigator)
+
+The standalone picker can behave like the file browser it grew out of: a panel
+that stays open, walks directories instead of exiting on every `cd`, and shows
+what mode it is in. The interaction layer comes from
+[fzf-navigator](https://github.com/benward2301/fzf-navigator) (MIT, © Ben Ward)
+— see `CREDITS.md` for the exact mapping and for the
+[broot](https://github.com/Canop/broot) heritage of the panel model.
+
+Keys, with the shell version's original binding when it differs:
+
+| Action | lusty | fzf-navigator | What it does |
+|---|---|---|---|
+| `open` | `enter`, `tab` | `space` | enter a directory, or print the selection |
+| `open_tab` / `open_split` / `open_vsplit` | `ctrl-t` / `ctrl-o` / `ctrl-v` | `ctrl-o` (`open_and_exit`) | open the selection in a tab / split / vsplit |
+| `insert_selection` | `alt-e` | `enter` | print the selection for insertion, relative to the **launch** dir |
+| `copy_selection` | `alt-y` | `ctrl-y` | copy the selection (absolute, shell-quoted) via OSC 52 |
+| `exit` | `ctrl-space` | `ctrl-space` | leave; in locked mode print the `cd` target |
+| `cancel` | `esc`, `ctrl-c`, `ctrl-g` | `esc` | back to the launch dir, and leave only from there |
+| `go_to_parent` | `alt-d` | `ctrl-d` | go to the parent directory |
+| `go_back` / `go_forward` | `ctrl-alt-o` / `ctrl-alt-i` | same | walk the directory history |
+| `go_to_session_start` | `[` | `[` | jump to the launch directory |
+| `go_home` | `\` | `\` | jump to `$HOME` |
+| `descend` | `/` | `/` (`go_to_root`) | descend into the typed directory, or `/` when the prompt is empty |
+| `toggle_hidden` | `alt-h` | `alt-h` | show dot entries without typing a leading dot (`H`) |
+| `toggle_skipped` | `alt-i` | `alt-i` | walk the `--skip` directories too (`I`) |
+| `toggle_locked` | `alt-l` | `ctrl-l` | locked mode (`L`) |
+| `toggle_recent_first` | `alt-t` | `ctrl-r` | newest-first order (`R`) |
+| `toggle_preview` | `alt-p` | — | preview pane |
+| `cycle_view` / `cycle_sort` / `cycle_depth` | `alt-v` / `ctrl-y` / `ctrl-d` | — | the layout, order and depth cycles lusty already had |
+| `mark` | `ctrl-x` | — | mark the entry and step down |
+| `reload` | `ctrl-r`, `alt-r` | `alt-r` | drop the caches and relist |
+| `redraw` | `ctrl-l` | — | repaint the picker (the terminal-canonical `C-l`) |
+| `toggle_help` | `?` | `?` | show the keymap overlay |
+
+Invariants (each one is asserted in the test suite):
+
+- **`C-l` repaints and `C-r` refreshes; neither switches a mode.** `C-l` means
+  "redraw" in vim, in `less` and in the shell, and `C-r` means "re-read" in
+  `less`, `mc` and most TUIs, so a layout cycle on `C-l` and a preview toggle on
+  `C-r` both surprised people. Layout moved to `alt-v` (view), the preview pane
+  to `alt-p` (pane), locked mode to `alt-l` (lock, the shell version's
+  `ctrl-l`); `LUSTY_KEYS` puts any of them back.
+- **one key, one action**; an action always keeps at least one key. A
+  `LUSTY_KEYS` entry *moves* its action (the shipped key stops firing) and a
+  second entry for the same action adds an alias — the shell version's
+  override rule.
+- **a typo costs one binding, not the keymap**: an unknown action or an
+  unparsable key is reported on stderr and the rest of the spec still applies.
+- **the help overlay is the keymap**: `?` renders `Action::ALL` order from the
+  same table the dispatcher reads, so a rebind shows up immediately and an
+  unbound action disappears. The overlay is scrollable and grows the popup
+  instead of clipping itself to five rows.
+- **printable action keys are shadows of real characters**: `/`, `[`, `\` and
+  `?` act only while the prompt is empty. With text in the prompt they are
+  typed, so `,`, `.`, `/` and every other character stay reachable
+  (`route_key` in `src/tui.rs`, and `type_into` is the only path a character
+  takes into the query). `/` keeps its one exception: it descends when the
+  typed prefix names a unique directory, and otherwise types a slash.
+- **inserted paths are anchored at the launch directory**, never at the browsed
+  one — `cd`-ing around inside the picker cannot break the command line it is
+  pasted into — and a bare executable name gets a `./` prefix so the shell does
+  not resolve a `PATH` twin.
+- **a fresh visit truncates the forward history tail**; `back`/`forward` stop at
+  the ends instead of wrapping; the launch directory stays reachable from
+  anywhere, which is what makes `cancel` a jump instead of an exit.
+- **no state is encoded in colour alone**: `H`/`I`/`L`/`R`, `+N` and `-N` are
+  letters and digits, and the icon tint never replaces the selection foreground
+  (the WCAG floors above still hold).
+
+Environment and flags for this layer:
+
+| Variable / flag | Effect |
+|---|---|
+| `LUSTY_KEYS`, `--keys SPEC` | rebind actions: `key=action,key=action` (both orders and `:` work) |
+| `LUSTY_LOCK_CWD=1`, `--locked` | start in locked mode |
+| `LUSTY_SHOW_HIDDEN=1`, `--show-hidden` | start with dot entries shown |
+| `LUSTY_ICON_THEME` | path to an eza `theme.yml`; `0`/`off` keeps only the built-in table |
+| `--key-map` | print `action<TAB>keys` for the resolved keymap (nvim parity) |
+| `--icon-color-map NAME...` | resolve icon colours per name (nvim parity) |
+
+Two extra actions on the line protocol make the shell contract usable:
+`insert<TAB>RELATIVE_PATH` (relative to the launch directory) and
+`cd<TAB>ABSOLUTE_PATH` (only on `exit` in locked mode, when the browsed
+directory changed).
+
+Icon colours follow the `theme.yml` that `fzf-navigator` ships for eza: lusty
+reads the file from `$EZA_CONFIG_DIR`, `$XDG_CONFIG_HOME/eza/theme.yml` or
+`$XDG_CONFIG_HOME/lusty/icon-theme.yml` (first one that exists), and falls back
+to a built-in table of the common extensions. Exact `filenames:` matches win
+over extensions, the longest suffix wins over the shortest, and a name the theme
+does not know keeps the `LS_COLORS` foreground.
 
 ### Colour invariants
 
