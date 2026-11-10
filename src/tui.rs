@@ -330,7 +330,7 @@ impl App {
             pop_top: 0,
             ui_rows: None,
             ui_width: None,
-            view: ViewMode::Grid,
+            view: ViewMode::List,
             icons: std::env::var("LUSTY_ICONS")
                 .map(|v| v == "1")
                 .unwrap_or(false),
@@ -390,8 +390,9 @@ impl App {
     }
 
     /// Override the popup size. CLI flags win over LUSTY_ROWS/LUSTY_WIDTH
-    /// env vars; None keeps the default (8 outer rows, full terminal
-    /// columns, i.e. 5 entry rows, the prompt and 100 content columns).
+    /// env vars; None keeps the default (16 outer rows like fzf
+    /// `--height=16`, full terminal columns: the prompt, the info line, ten
+    /// entry rows and the footer).
     /// Apply eza-style order tweaks to in-memory listings.
     pub fn set_sort(&mut self, reverse: bool, dirs_first: bool) {
         self.reverse = reverse;
@@ -1086,7 +1087,8 @@ impl App {
         // the overlay closes, so `?` is a real help screen and not a teaser
         // clipped to five rows.
         let outer_h = if self.help_on {
-            outer_h.max((self.help_len() + 3).min(h))
+            // Borders, prompt, info line and the two-row footer also fit.
+            outer_h.max((self.help_len() + 5).min(h))
         } else {
             outer_h
         };
@@ -1103,9 +1105,33 @@ impl App {
         self.preview_w = pw.clamp(20, self.box_w.saturating_sub(21).max(20));
     }
 
-    /// Rows of the entry area inside the borders, prompt excluded.
+    /// Rows of the entry area inside the borders: prompt, info line and the
+    /// two-row footer excluded.
+    ///
+    /// fzf layout (`--layout=reverse`, `--info=default`, footer): the prompt
+    /// sits on the first inner row, the info line right under it, the entries
+    /// follow and the footer (separator + hints) closes the frame. Tight
+    /// windows drop the footer first and then the info line, so a `--rows 4`
+    /// strip still shows one entry.
     fn content_rows(&self) -> usize {
-        self.box_h.saturating_sub(3).max(1)
+        let inside = self.box_h.saturating_sub(2);
+        inside
+            .saturating_sub(1) // prompt
+            .saturating_sub(self.info_row())
+            .saturating_sub(self.footer_rows())
+            .max(1)
+    }
+
+    /// One row for the `matched/total` line under the prompt; dropped when
+    /// prompt + info + one entry no longer fit.
+    fn info_row(&self) -> usize {
+        usize::from(self.box_h.saturating_sub(2) >= 3)
+    }
+
+    /// Two rows for the footer: the separator line and the key hints. Dropped
+    /// when they would leave no entry row at all.
+    fn footer_rows(&self) -> usize {
+        2 * usize::from(self.box_h.saturating_sub(2) >= 6)
     }
 
     /// The long view only earns its meta columns when at least two entry rows
@@ -1519,14 +1545,15 @@ impl App {
             frame.push_str(line);
             line.clear();
             // Divider between list and preview pane.
-            frame.push_str(&format!("{esc}[{FRAME_BORDER}m"));
+            let th = theme();
+            frame.push_str(&format!("{esc}[{}m", th.fg_sgr(th.border)));
             frame.push('\u{2502}'); // \u2502
             frame.push_str(&format!("{esc}[0m"));
             // Right: one pre-rendered pane row.
             if let Some(prow) = self.pane.get(r) {
                 frame.push_str(prow);
             }
-            frame.push_str(&format!("{esc}[{FRAME_BG}m"));
+            frame.push_str(&format!("{esc}[{}m", theme().bg_sgr(theme().bg)));
         } else {
             ansi_pad(line, w);
             frame.push_str(line);
@@ -1567,23 +1594,43 @@ impl App {
         // Multi-column layouts size every column; a single column spans the
         // whole list area.
         let col_w = if cols > 1 { self.col_width() } else { lw };
-        let bg = FRAME_BG;
-        let border = FRAME_BORDER;
+        let th = theme();
+        let bg = th.bg_sgr(th.bg);
+        let border = th.fg_sgr(th.border);
         let revert = format!("{esc}[22;23;24;39;{bg}m"); // default fg on popup bg
         let mut frame = String::with_capacity((w + 64) * (bh + 2));
+        frame.push_str(&format!("{esc}[?25l"));
 
-        // Top border: box-drawing frame around w content columns.
+        // Top border: sharp frame (fzf `--border=sharp`) with the browsed
+        // directory in the border-label slot, where fzf keeps the context that
+        // does not belong in the query.
+        let label = self.border_label(w.saturating_sub(5));
         frame.push_str(&format!("{esc}[{};1H", top + 1));
         frame.push_str(&format!("{esc}[{bg}m{esc}[{border}m"));
         frame.push('\u{250c}'); // \u250c
-        for _ in 0..w {
+        let mut used = 0usize;
+        if !label.is_empty() {
+            frame.push('\u{2500}'); // \u2500
+            frame.push(' ');
+            frame.push_str(&format!("{esc}[{}m", th.fg_sgr(th.info)));
+            frame.push_str(&label);
+            frame.push_str(&format!("{esc}[{border}m"));
+            frame.push(' ');
+            used = str_width(&label) + 3;
+        }
+        for _ in used..w {
             frame.push('\u{2500}'); // \u2500
         }
         frame.push('\u{2510}'); // \u2510
         frame.push_str(&format!("{esc}[0m{esc}[K"));
-        // Content rows: entry grid on top, prompt as the bottom line. The long
-        // view spends its first content row on a column header that uses the
-        // same field widths as the rows, so the entries start one row lower.
+        // fzf layout: the prompt is the first inner row, the info line sits
+        // right under it, the entries follow and the footer (separator + key
+        // hints) closes the frame. The long view spends the first entry row on
+        // a column header, so its entries start one row lower.
+        let info_rows = self.info_row();
+        let entries_top = 1 + info_rows;
+        let entries_area = self.content_rows();
+        let footer_start = entries_top + entries_area;
         let long_header = if self.shows_long_header() && help.is_none() {
             lusty_core::listing::meta_header(self.cols_mask)
         } else {
@@ -1594,31 +1641,40 @@ impl App {
             frame.push_str(&format!("{esc}[{bg}m{esc}[{border}m"));
             frame.push('\u{2502}'); // \u2502
             let mut line = String::new();
-            let header_row = long_header.is_some() && r == 0;
-            // Entry row for this screen row; None on the header row itself.
-            let entry_row = match long_header {
-                Some(_) => r.checked_sub(1),
-                None => Some(r),
-            };
-            if let Some(help_rows) = &help {
-                // One help line per screen row, scrolled by `help_offset`.
-                // The keys column keeps the shell version's padding, so the
-                // descriptions line up like they do in its footer.
-                if let Some(text) = help_rows.get(self.help_offset + r) {
-                    line.push_str(&format!("{esc}[{DIM_FG}m"));
-                    line.push_str(&sanitize_display(text));
+            if r == 0 {
+                // Prompt row: fzf's `❯  ` glyph and the query; the terminal
+                // cursor is parked at the end of the query after the frame.
+                line = self.prompt_line();
+                ansi_pad(&mut line, w);
+                frame.push_str(&line);
+            } else if info_rows == 1 && r == 1 {
+                line = self.info_line(w);
+                ansi_pad(&mut line, w);
+                frame.push_str(&line);
+            } else if r >= entries_top && r < footer_start {
+                let er = r - entries_top;
+                // Entry index inside the list (the long-view header is not
+                // an entry), None on the header row itself.
+                let entry_row = match long_header {
+                    Some(_) => er.checked_sub(1),
+                    None => Some(er),
+                };
+                if let Some(help_rows) = &help {
+                    // One help line per screen row, scrolled by `help_offset`.
+                    if let Some(text) = help_rows.get(self.help_offset + er) {
+                        line.push_str(&format!("{esc}[{}m", th.fg_sgr(th.info)));
+                        line.push_str(&sanitize_display(text));
+                        line.push_str(&revert);
+                    }
+                    self.close_row(&mut frame, &mut line, er, esc, lw, w);
+                } else if long_header.is_some() && er == 0 {
+                    let h = long_header.as_deref().unwrap_or_default();
+                    // Two cells for the pointer/marker columns, so NAME lines
+                    // up with the names below.
+                    line.push_str(&format!("{esc}[{}m  {h} NAME", th.fg_sgr(th.info)));
                     line.push_str(&revert);
-                }
-                self.close_row(&mut frame, &mut line, r, esc, lw, w);
-            } else if header_row {
-                let h = long_header.as_deref().unwrap_or_default();
-                // One space for the mark column, so NAME lines up with the
-                // labels below.
-                line.push_str(&format!("{esc}[{DIM_FG}m {h} NAME"));
-                line.push_str(&revert);
-                self.close_row(&mut frame, &mut line, r, esc, lw, w);
-            } else if let Some(er) = entry_row {
-                if er < rows {
+                    self.close_row(&mut frame, &mut line, er, esc, lw, w);
+                } else if let Some(er) = entry_row {
                     for c in 0..cols {
                         // Column-major, the same mapping `grid_index` and the
                         // column navigation use: the grid is `rows` cells tall
@@ -1630,55 +1686,54 @@ impl App {
                             let e = self.listing()[i].clone();
                             let marked = self.is_marked(&e.path(&root_path));
                             let selected = pos == self.selected;
-                            // Tint the whole cell — mark column and padding
-                            // included — with the selection background, or with
-                            // the mark background when the cursor is elsewhere.
+                            // fzf line prefix: the pointer `▶` on the current
+                            // row, the gutter bar `▌` elsewhere, then the
+                            // marker column with `✓` on marked rows. No
+                            // background tint: the current line is only fg+.
                             if selected {
-                                cell.push_str(&format!("{esc}[{}m", sel_style()));
-                            } else if marked {
-                                cell.push_str(&format!("{esc}[{MARK_BG}m"));
+                                cell.push_str(&format!(
+                                    "{esc}[{}m{}",
+                                    th.fg_sgr(th.pointer_fg),
+                                    th.pointer
+                                ));
+                            } else if cols == 1 {
+                                cell.push_str(&format!("{esc}[{}m\u{258c}", th.fg_sgr(th.fg)));
+                            } else {
+                                cell.push(' ');
                             }
-                            // One-cell mark column. A glyph, not just a tint:
-                            // the mark has to survive a monochrome terminal.
-                            // Its own foreground keeps the glyph readable on
-                            // the mark tint whatever the terminal default is.
                             if marked {
-                                cell.push_str(&format!("{esc}[{MARK_FG}m"));
+                                cell.push_str(&format!(
+                                    "{esc}[{}m{}",
+                                    th.fg_sgr(th.marker_fg),
+                                    th.marker
+                                ));
+                            } else {
+                                cell.push(' ');
                             }
-                            cell.push_str(if marked { "+" } else { " " });
-                            if marked {
-                                cell.push_str(&format!("{esc}[39m"));
-                            }
+                            // Name colour: fzf `fg+` on the current row, the
+                            // LS_COLORS / list foreground elsewhere.
+                            let name_sgr = if selected {
+                                th.fg_sgr(th.fg_current)
+                            } else {
+                                self.palette
+                                    .code_for(e.basename(), e.kind, is_exec(&e.path(&root_path)))
+                                    .map(str::to_string)
+                                    .unwrap_or_else(|| th.fg_sgr(th.fg))
+                            };
                             if self.shows_meta() {
                                 if let Some(m) = lusty_core::listing::meta_line(
                                     &e.path(&root_path),
                                     self.cols_mask,
                                 ) {
-                                    cell.push_str(&format!("{esc}[{DIM_FG}m{m}"));
-                                    // Drop the dim meta foreground but keep the
-                                    // cell background.
-                                    cell.push_str(&format!("{esc}[39m"));
-                                    cell.push(' ');
+                                    cell.push_str(&format!("{esc}[{}m{m} ", th.fg_sgr(th.info)));
                                 }
                             }
-                            if selected {
-                                // Restore the selection foreground after the
-                                // meta reset; the background is already on.
-                                cell.push_str(&format!("{esc}[{}m", sel_style()));
-                            } else if let Some(code) = self.palette.code_for(
-                                e.basename(),
-                                e.kind,
-                                is_exec(&e.path(&root_path)),
-                            ) {
-                                cell.push_str(&format!("{esc}[{code}m"));
-                            }
+                            cell.push_str(&format!("{esc}[{name_sgr}m"));
                             if self.icons {
                                 // Truecolor icon: the glyph takes the colour of
                                 // its extension from theme.yml. On the cursor
-                                // row it keeps the selection foreground — the
-                                // contrast floor is asserted for the selection
-                                // text, and a decorative tint must not repaint
-                                // over it.
+                                // row it keeps the row foreground, like the
+                                // rest of the line.
                                 let tint = if selected {
                                     None
                                 } else {
@@ -1689,18 +1744,7 @@ impl App {
                                 }
                                 cell.push_str(icon_for(&e));
                                 if tint.is_some() {
-                                    // Back to the palette colour of the name,
-                                    // or to the terminal default.
-                                    match self.palette.code_for(
-                                        e.basename(),
-                                        e.kind,
-                                        is_exec(&e.path(&root_path)),
-                                    ) {
-                                        Some(code) if !selected => {
-                                            cell.push_str(&format!("{esc}[{code}m"));
-                                        }
-                                        _ => cell.push_str(&format!("{esc}[39m")),
-                                    }
+                                    cell.push_str(&format!("{esc}[{name_sgr}m"));
                                 }
                                 cell.push(' ');
                             }
@@ -1709,21 +1753,11 @@ impl App {
                             // the frame.
                             let label = sanitize_display(&e.label);
                             if let Some((ms, me)) = query_match(&label, &self.query) {
+                                let hl = if selected { th.hl_current } else { th.hl };
                                 cell.push_str(&label[..ms]);
-                                let mt = theme();
-                                if let Some([r, g, b]) = mt.match_fg {
-                                    cell.push_str(&format!("{esc}[38;2;{r};{g};{b}m"));
-                                }
-                                if mt.match_underline {
-                                    cell.push_str(&format!("{esc}[4m"));
-                                }
+                                cell.push_str(&format!("{esc}[{}m", th.fg_sgr(hl)));
                                 cell.push_str(&label[ms..me]);
-                                if mt.match_underline {
-                                    cell.push_str(&format!("{esc}[24m"));
-                                }
-                                if mt.match_fg.is_some() {
-                                    cell.push_str(&format!("{esc}[39m"));
-                                }
+                                cell.push_str(&format!("{esc}[{name_sgr}m"));
                                 cell.push_str(&label[me..]);
                             } else {
                                 cell.push_str(&label);
@@ -1732,9 +1766,8 @@ impl App {
                                 cell.push('/');
                             }
                         }
-                        // Pad first and reset after: the selected cell keeps
-                        // its background across the whole column instead of
-                        // stopping at the end of the name.
+                        // Pad first and reset after: a cell keeps the row
+                        // background across its whole column.
                         ansi_pad(&mut cell, col_w);
                         cell.push_str(&revert);
                         line.push_str(&cell);
@@ -1742,12 +1775,24 @@ impl App {
                             line.push_str("  ");
                         }
                     }
-                    self.close_row(&mut frame, &mut line, r, esc, lw, w);
-                } else if er == rows {
-                    line = self.prompt_line();
-                    ansi_pad(&mut line, w);
-                    frame.push_str(&line);
+                    self.close_row(&mut frame, &mut line, er, esc, lw, w);
+                } else {
+                    ansi_pad(&mut line, lw);
+                    self.close_row(&mut frame, &mut line, er, esc, lw, w);
                 }
+            } else if r == footer_start && self.footer_rows() == 2 {
+                // Footer border: the line fzf draws above the key hints.
+                line.push_str(&format!("{esc}[{}m", th.fg_sgr(th.border)));
+                line.push_str(&"\u{2500}".repeat(w));
+                line.push_str(&revert);
+                frame.push_str(&line);
+            } else if r == footer_start + 1 && self.footer_rows() == 2 {
+                line = self.footer_line();
+                ansi_pad(&mut line, w);
+                frame.push_str(&line);
+            } else {
+                ansi_pad(&mut line, w);
+                frame.push_str(&line);
             }
             frame.push_str(&format!("{esc}[{border}m"));
             frame.push('\u{2502}'); // \u2502
@@ -1782,6 +1827,11 @@ impl App {
             self.kitty_drawn = false;
             self.kitty_key = None;
         }
+        // Park the terminal cursor at the end of the query, the way fzf shows
+        // a real block cursor in its input line.
+        let cursor_row = top + 2; // 1-based row of the prompt line
+        let cursor_col = 2 + str_width(&th.prompt) + str_width(&self.query);
+        frame.push_str(&format!("{esc}[{cursor_row};{cursor_col}H{esc}[?25h"));
         write!(out, "{frame}")?;
         out.flush()
     }
@@ -1816,84 +1866,24 @@ impl App {
         self.icon_theme.as_ref().and_then(|t| t.color_for(name))
     }
 
+    /// fzf prompt row: the `❯  ` glyph and the query. Everything fzf keeps out
+    /// of the input (counter, depth, flags) moved to [`Self::info_line`], and
+    /// the browsed directory to the border label.
     fn prompt_line(&self) -> String {
         let esc = char::from_u32(0x1b).unwrap();
+        let th = theme();
         let mut out = String::new();
-        if self.icons {
-            out.push(esc);
-            out.push_str(&format!("[{DIM_FG}m"));
-            out.push_str(ICON_DIR);
-            out.push(' ');
-        }
-        let push_painted = |text: &str, code: &str, out: &mut String| {
-            if text.is_empty() {
-                return;
-            }
-            out.push(esc);
-            out.push('[');
-            out.push_str(code);
-            out.push('m');
-            out.push_str(text);
-        };
-        // Path, in the shell version's shape: the directory the picker was
-        // launched from is the anchor, the browsed subpath follows after `>`
-        // (`*>` when the current directory is an ancestor of the start or on a
-        // fork). At the start directory the prompt is just that path.
-        let home = std::env::var("HOME").unwrap_or_default();
-        let start = paths::tildify(&self.history.session_start().display().to_string(), &home);
-        let current = paths::tildify(&self.root.display().to_string(), &home);
-        let pp = paths::prompt_path(&start, &current);
-        let paint_components = |text: &str, out: &mut String| {
-            let text = sanitize_display(text);
-            let mut part = String::new();
-            for ch in text.chars() {
-                if ch == '/' {
-                    push_painted(&part, "38;2;149;167;188", out);
-                    push_painted("/", "38;2;0;95;175", out);
-                    part.clear();
-                } else {
-                    part.push(ch);
-                }
-            }
-            push_painted(&part, "38;2;149;167;188", out);
-        };
-        match pp.anchor.strip_prefix('~') {
-            Some(rest) => {
-                push_painted("~", "38;2;40;115;115", &mut out);
-                paint_components(rest, &mut out);
-            }
-            None => paint_components(&pp.anchor, &mut out),
-        }
-        let separator = match pp.rel {
-            paths::PromptRel::Same => " \u{f105} ",
-            paths::PromptRel::Child => " > ",
-            paths::PromptRel::Ancestor | paths::PromptRel::Fork => " *> ",
-        };
-        push_painted(separator, "38;2;0;95;175", &mut out);
-        paint_components(&pp.subpath, &mut out);
-        push_painted(&self.query, "1;38;2;255;255;255", &mut out);
-        // Search depth (C-d cycles it) and the matched/total counter, dimmed
-        // like the border.
-        push_painted(
-            &format!(
-                "  d{}  {}/{}",
-                self.opts.depth,
-                self.ranked.len(),
-                self.total
-            ),
-            DIM_FG,
-            &mut out,
-        );
-        // Marked entries: a running total, signed so it does not read as part
-        // of the filter counter.
-        if !self.marked.is_empty() {
-            push_painted(&format!("  +{}", self.marked.len()), DIM_FG, &mut out);
-        }
-        // Status flags, ported from the shell version's info line: H hidden
-        // files, I skipped dirs are being walked, L locked, R newest-first,
-        // and `-N` for the entries the dot rule hides in this directory. Each
-        // flag is a letter, not a colour, so the state survives a monochrome
-        // terminal.
+        out.push_str(&format!("{esc}[{}m{}", th.fg_sgr(th.prompt_fg), th.prompt));
+        out.push_str(&format!("{esc}[{}m", th.fg_sgr(th.input)));
+        out.push_str(&sanitize_display(&self.query));
+        out
+    }
+
+    /// Status flags, ported from the shell version's info line: H hidden
+    /// files, I skipped dirs are being walked, L locked, R newest-first, and
+    /// `-N` for the entries the dot rule hides in this directory. Each flag is
+    /// a letter, not a colour, so the state survives a monochrome terminal.
+    fn status_flags(&self) -> String {
         let mut flags = String::new();
         if self.dots_on {
             flags.push('H');
@@ -1913,86 +1903,160 @@ impl App {
             }
             flags.push_str(&format!("-{}", self.hidden_shown));
         }
+        flags
+    }
+
+    /// fzf info line under the prompt: the `matched/total` counter with the
+    /// mark count fzf appends for `--multi`, the search depth, the status
+    /// flags and the one-shot notice, then the `─` rule that fills the row.
+    fn info_line(&self, w: usize) -> String {
+        let esc = char::from_u32(0x1b).unwrap();
+        let th = theme();
+        let mut text = format!("  {}/{}", self.ranked.len(), self.total);
+        if !self.marked.is_empty() {
+            text.push_str(&format!(" ({})", self.marked.len()));
+        }
+        text.push_str(&format!("  d{}", self.opts.depth));
+        let flags = self.status_flags();
         if !flags.is_empty() {
-            push_painted(&format!("  {flags}"), DIM_FG, &mut out);
+            text.push(' ');
+            text.push_str(&flags);
         }
-        // One-shot feedback for actions that leave no other trace (copy,
-        // reload, toggles): cleared on the next key press.
         if let Some(notice) = &self.notice {
-            push_painted(&format!("  {notice}"), "38;2;209;229;255", &mut out);
+            text.push_str(&format!("  {notice}"));
         }
-        out.push(esc);
-        out.push_str("[22;23;24;39m");
+        let mut out = format!("{esc}[{}m{text}", th.fg_sgr(th.info));
+        let fill = w.saturating_sub(str_width(&text) + 2);
+        if fill > 0 {
+            out.push_str(&format!("{esc}[{}m ", th.fg_sgr(th.separator)));
+            out.push_str(&"\u{2500}".repeat(fill.saturating_sub(1)));
+        }
         out
+    }
+
+    /// Key hints in fzf's footer shape. Static: the real, remapped key table
+    /// is one `?` away (the help overlay prints it live).
+    fn footer_text(&self) -> String {
+        "[Alt-v] View  [Alt-p] Preview  [C-y] Sort  [C-d] Depth  [C-x] Mark  [?] Help".to_string()
+    }
+
+    /// fzf footer row: the key hints, underlined white like the profile's
+    /// `--footer` line.
+    fn footer_line(&self) -> String {
+        let esc = char::from_u32(0x1b).unwrap();
+        let th = theme();
+        let mut out = String::from("  ");
+        out.push_str(&format!("{esc}[{}m", th.fg_sgr(th.footer_fg)));
+        if th.footer_underline {
+            out.push_str(&format!("{esc}[4m"));
+        }
+        out.push_str(&self.footer_text());
+        if th.footer_underline {
+            out.push_str(&format!("{esc}[24m"));
+        }
+        out
+    }
+
+    /// Browsed directory for the border label, in the `prompt_path()` shape the
+    /// old prompt used: anchor, separator, subpath. Trimmed from the left so
+    /// the changing tail of the path stays visible.
+    fn border_label(&self, max: usize) -> String {
+        let home = std::env::var("HOME").unwrap_or_default();
+        let start = paths::tildify(&self.history.session_start().display().to_string(), &home);
+        let current = paths::tildify(&self.root.display().to_string(), &home);
+        let pp = paths::prompt_path(&start, &current);
+        let label = if pp.subpath.is_empty() {
+            pp.anchor.clone()
+        } else {
+            let separator = match pp.rel {
+                paths::PromptRel::Same => " \u{276f} ",
+                paths::PromptRel::Child => " > ",
+                paths::PromptRel::Ancestor | paths::PromptRel::Fork => " *> ",
+            };
+            format!("{}{}{}", pp.anchor, separator, pp.subpath)
+        };
+        fit_left(&sanitize_display(&label), max)
     }
 }
 
-/// Outer popup height: two border rows plus five entry rows and the prompt.
-const OUTER_ROWS: usize = 8;
+/// Outer popup height: fzf's `--height=16` — sharp frame, prompt, info line,
+/// ten entry rows and the two-row footer.
+const OUTER_ROWS: usize = 16;
 
-/// Frame colors: the opaque popup background and the darker frame/meta border,
-/// shared by the frame itself and the per-row finisher.
-const FRAME_BG: &str = "48;2;0;0;0";
-const FRAME_BORDER: &str = "38;2;58;68;84";
-/// Background of a marked entry. The cursor row keeps the selection
-/// background and wins while it sits on a marked entry, so the two states stay
-/// apart; the `+` mark column repeats the difference without relying on colour.
-const MARK_BG: &str = "48;2;0;70;60";
-/// Foreground of the `+` mark column, so the marker itself stays readable on
-/// the mark tint instead of inheriting whatever the terminal default is.
-const MARK_FG: &str = "38;2;209;229;255";
-/// Dim tone of the meta columns, the long header, the depth and the counter:
-/// readable on the popup background, clearly secondary (see the
-/// `contrast_invariants` tests).
-const DIM_FG: &str = "38;2;108;126;150";
+/// Default glyphs and palette: the fzf profile from `FZF_DEFAULT_OPTS`
+/// (modules/user/nix-maid/cli/search.nix), so the picker reads as the same
+/// tool as fzf. `theme.toml` overrides any value; the nvim front-end reads
+/// the same file, which keeps one source of truth for both interfaces.
+const DEFAULT_PROMPT: &str = "❯  ";
+const DEFAULT_POINTER: &str = "▶";
+const DEFAULT_MARKER: &str = "✓";
+const DEFAULT_BG: [u8; 3] = [0x00, 0x00, 0x00];
+const DEFAULT_FG: [u8; 3] = [0x4f, 0x5d, 0x78];
+const DEFAULT_FG_CURRENT: [u8; 3] = [0x8d, 0xa6, 0xb2];
+const DEFAULT_HL: [u8; 3] = [0x54, 0x6c, 0x8a];
+const DEFAULT_HL_CURRENT: [u8; 3] = [0x00, 0x5f, 0xaf];
+const DEFAULT_BORDER: [u8; 3] = [0x0b, 0x25, 0x36];
+const DEFAULT_SEPARATOR: [u8; 3] = [0x0b, 0x25, 0x36];
+const DEFAULT_INFO: [u8; 3] = [0x3f, 0x58, 0x76];
+const DEFAULT_INPUT: [u8; 3] = [0x6c, 0x7e, 0x96];
+const DEFAULT_PROMPT_FG: [u8; 3] = [0x00, 0x5f, 0xaf];
+const DEFAULT_POINTER_FG: [u8; 3] = [0x00, 0x5f, 0xaf];
+const DEFAULT_MARKER_FG: [u8; 3] = [0x04, 0x14, 0x1c];
+const DEFAULT_FOOTER_FG: [u8; 3] = [0xff, 0xff, 0xff];
+const DEFAULT_PREVIEW_FG: [u8; 3] = [0x4f, 0x5d, 0x78];
 
-/// Selection theme loaded from the Lusty TOML (env `LUSTY_THEME`; by default
-/// the nvim copy at `$XDG_CONFIG_HOME/nvim/lua/lusty/theme.toml`, then the
-/// standalone one at `$XDG_CONFIG_HOME/lusty/theme.toml`). The file uses the
-/// same simple key=value lines the nvim side reads, so both interfaces share
-/// one theme; `--theme-map` dumps the resolved values for the parity smoke.
+/// Resolved look shared with the nvim front-end: `theme.toml` carries the
+/// glyphs ([lusty.profile]) and the fzf palette ([lusty.colors]). Defaults are
+/// the profile itself, so a missing file still renders like fzf.
 struct Theme {
-    sel_bg: Option<[u8; 3]>,
-    sel_fg: Option<[u8; 3]>,
-    sel_bold: bool,
-    sel_underline: bool,
-    sel_reverse: bool,
-    match_fg: Option<[u8; 3]>,
-    match_underline: bool,
+    prompt: String,
+    pointer: String,
+    marker: String,
+    footer_underline: bool,
+    bg: [u8; 3],
+    fg: [u8; 3],
+    fg_current: [u8; 3],
+    hl: [u8; 3],
+    hl_current: [u8; 3],
+    border: [u8; 3],
+    separator: [u8; 3],
+    info: [u8; 3],
+    input: [u8; 3],
+    prompt_fg: [u8; 3],
+    pointer_fg: [u8; 3],
+    marker_fg: [u8; 3],
+    footer_fg: [u8; 3],
+    preview_fg: [u8; 3],
 }
 
 impl Theme {
-    /// Enforce the legibility invariants on a parsed theme: the selection has
-    /// to stand out from the popup and carry readable text, and the match
-    /// highlight has to stay readable on both backgrounds it is painted over.
-    /// A field that breaks its floor falls back to the default, so a bad
-    /// theme.toml degrades to readable colours instead of an unreadable frame.
+    /// `38;2;r;g;b` for one foreground role.
+    fn fg_sgr(&self, color: [u8; 3]) -> String {
+        format!("38;2;{};{};{}", color[0], color[1], color[2])
+    }
+
+    /// `48;2;r;g;b` for one background role.
+    fn bg_sgr(&self, color: [u8; 3]) -> String {
+        format!("48;2;{};{};{}", color[0], color[1], color[2])
+    }
+
+    /// Keep the text the eye follows legible even in a hand-edited theme: the
+    /// current line, the query and the footer fall back to the default when a
+    /// custom background would swallow them. The dim tones (`fg`, `hl`, `info`,
+    /// `border`, `marker`) are the profile's deliberate low-contrast choices
+    /// and are honoured verbatim.
     fn sanitized(mut self) -> Theme {
         let default = theme_default();
-        let popup = contrast::sgr_rgb(FRAME_BG).unwrap_or([0, 0, 0]);
-        if let Some(bg) = self.sel_bg {
-            if contrast::contrast_ratio(bg, popup) < contrast::MIN_UI {
-                self.sel_bg = default.sel_bg;
-            }
+        let readable =
+            |fg: [u8; 3], bg: [u8; 3]| contrast::contrast_ratio(fg, bg) >= contrast::MIN_TEXT;
+        if !readable(self.fg_current, self.bg) {
+            self.fg_current = default.fg_current;
         }
-        let sel_bg = self.sel_bg.or(default.sel_bg);
-        if let Some(fg) = self.sel_fg {
-            let ratio = sel_bg
-                .map(|bg| contrast::contrast_ratio(fg, bg))
-                .unwrap_or(contrast::MIN_TEXT);
-            if ratio < contrast::MIN_TEXT {
-                self.sel_fg = default.sel_fg;
-            }
+        if !readable(self.input, self.bg) {
+            self.input = default.input;
         }
-        if let Some(fg) = self.match_fg {
-            let on_popup = contrast::contrast_ratio(fg, popup);
-            let on_sel = match sel_bg {
-                Some(bg) => contrast::contrast_ratio(fg, bg),
-                None => contrast::MIN_TEXT,
-            };
-            if on_popup < contrast::MIN_TEXT || on_sel < contrast::MIN_TEXT {
-                self.match_fg = default.match_fg;
-            }
+        if !readable(self.footer_fg, self.bg) {
+            self.footer_fg = default.footer_fg;
         }
         self
     }
@@ -2012,13 +2076,24 @@ fn hex3(s: &str) -> Option<[u8; 3]> {
 
 fn theme_default() -> Theme {
     Theme {
-        sel_bg: Some([0x00, 0x5f, 0xaf]),
-        sel_fg: Some([0xd1, 0xe5, 0xff]),
-        sel_bold: true,
-        sel_underline: false,
-        sel_reverse: false,
-        match_fg: None,
-        match_underline: true,
+        prompt: DEFAULT_PROMPT.to_string(),
+        pointer: DEFAULT_POINTER.to_string(),
+        marker: DEFAULT_MARKER.to_string(),
+        footer_underline: true,
+        bg: DEFAULT_BG,
+        fg: DEFAULT_FG,
+        fg_current: DEFAULT_FG_CURRENT,
+        hl: DEFAULT_HL,
+        hl_current: DEFAULT_HL_CURRENT,
+        border: DEFAULT_BORDER,
+        separator: DEFAULT_SEPARATOR,
+        info: DEFAULT_INFO,
+        input: DEFAULT_INPUT,
+        prompt_fg: DEFAULT_PROMPT_FG,
+        pointer_fg: DEFAULT_POINTER_FG,
+        marker_fg: DEFAULT_MARKER_FG,
+        footer_fg: DEFAULT_FOOTER_FG,
+        preview_fg: DEFAULT_PREVIEW_FG,
     }
 }
 
@@ -2067,13 +2142,24 @@ fn load_theme() -> Theme {
         let key = key.trim();
         let val = val.trim().trim_matches('"');
         match (section.as_str(), key) {
-            ("lusty.selection", "bg") => t.sel_bg = hex3(val),
-            ("lusty.selection", "fg") => t.sel_fg = hex3(val),
-            ("lusty.selection", "bold") => t.sel_bold = val == "true",
-            ("lusty.selection", "underline") => t.sel_underline = val == "true",
-            ("lusty.selection", "reverse") => t.sel_reverse = val == "true",
-            ("lusty.match", "fg") => t.match_fg = hex3(val),
-            ("lusty.match", "underline") => t.match_underline = val == "true",
+            ("lusty.profile", "prompt") => t.prompt = val.to_string(),
+            ("lusty.profile", "pointer") => t.pointer = val.to_string(),
+            ("lusty.profile", "marker") => t.marker = val.to_string(),
+            ("lusty.profile", "footer_underline") => t.footer_underline = val == "true",
+            ("lusty.colors", "bg") => t.bg = hex3(val).unwrap_or(t.bg),
+            ("lusty.colors", "fg") => t.fg = hex3(val).unwrap_or(t.fg),
+            ("lusty.colors", "fg_current") => t.fg_current = hex3(val).unwrap_or(t.fg_current),
+            ("lusty.colors", "hl") => t.hl = hex3(val).unwrap_or(t.hl),
+            ("lusty.colors", "hl_current") => t.hl_current = hex3(val).unwrap_or(t.hl_current),
+            ("lusty.colors", "border") => t.border = hex3(val).unwrap_or(t.border),
+            ("lusty.colors", "separator") => t.separator = hex3(val).unwrap_or(t.separator),
+            ("lusty.colors", "info") => t.info = hex3(val).unwrap_or(t.info),
+            ("lusty.colors", "input") => t.input = hex3(val).unwrap_or(t.input),
+            ("lusty.colors", "prompt") => t.prompt_fg = hex3(val).unwrap_or(t.prompt_fg),
+            ("lusty.colors", "pointer") => t.pointer_fg = hex3(val).unwrap_or(t.pointer_fg),
+            ("lusty.colors", "marker") => t.marker_fg = hex3(val).unwrap_or(t.marker_fg),
+            ("lusty.colors", "footer") => t.footer_fg = hex3(val).unwrap_or(t.footer_fg),
+            ("lusty.colors", "preview_fg") => t.preview_fg = hex3(val).unwrap_or(t.preview_fg),
             _ => {}
         }
     }
@@ -2081,56 +2167,39 @@ fn load_theme() -> Theme {
 }
 
 /// Resolved theme as `key\tvalue` lines, used by `--theme-map` and the nvim
-/// parity smoke (values are `#rrggbb`, `true`/`false` or `none`).
+/// parity smoke (colours are `#rrggbb`). Both readers resolve every key, so
+/// the fixture comparison cannot drift.
 pub fn theme_dump() -> Vec<(String, String)> {
     let t = load_theme();
-    let hex = |c: Option<[u8; 3]>| {
-        c.map(|[r, g, b]| format!("#{r:02x}{g:02x}{b:02x}"))
-            .unwrap_or_else(|| "none".to_string())
-    };
+    let hex = |c: [u8; 3]| format!("#{:02x}{:02x}{:02x}", c[0], c[1], c[2]);
     vec![
-        ("selection.bg".to_string(), hex(t.sel_bg)),
-        ("selection.fg".to_string(), hex(t.sel_fg)),
-        ("selection.bold".to_string(), t.sel_bold.to_string()),
+        ("profile.prompt".to_string(), t.prompt),
+        ("profile.pointer".to_string(), t.pointer),
+        ("profile.marker".to_string(), t.marker),
         (
-            "selection.underline".to_string(),
-            t.sel_underline.to_string(),
+            "profile.footer_underline".to_string(),
+            t.footer_underline.to_string(),
         ),
-        ("selection.reverse".to_string(), t.sel_reverse.to_string()),
-        ("match.fg".to_string(), hex(t.match_fg)),
-        ("match.underline".to_string(), t.match_underline.to_string()),
+        ("colors.bg".to_string(), hex(t.bg)),
+        ("colors.fg".to_string(), hex(t.fg)),
+        ("colors.fg_current".to_string(), hex(t.fg_current)),
+        ("colors.hl".to_string(), hex(t.hl)),
+        ("colors.hl_current".to_string(), hex(t.hl_current)),
+        ("colors.border".to_string(), hex(t.border)),
+        ("colors.separator".to_string(), hex(t.separator)),
+        ("colors.info".to_string(), hex(t.info)),
+        ("colors.input".to_string(), hex(t.input)),
+        ("colors.prompt".to_string(), hex(t.prompt_fg)),
+        ("colors.pointer".to_string(), hex(t.pointer_fg)),
+        ("colors.marker".to_string(), hex(t.marker_fg)),
+        ("colors.footer".to_string(), hex(t.footer_fg)),
+        ("colors.preview_fg".to_string(), hex(t.preview_fg)),
     ]
 }
 
 static THEME: std::sync::OnceLock<Theme> = std::sync::OnceLock::new();
 fn theme() -> &'static Theme {
     THEME.get_or_init(load_theme)
-}
-
-/// SGR params for the selected cell, built from the loaded theme (or a
-/// default neg-blue bar when no theme file is found).
-fn sel_style() -> String {
-    let mut s = String::new();
-    if theme().sel_bold {
-        s.push_str("1;");
-    }
-    if theme().sel_reverse {
-        s.push_str("7;");
-    }
-    if theme().sel_underline {
-        s.push_str("4;");
-    }
-    if let Some([r, g, b]) = theme().sel_bg {
-        s.push_str(&format!("48;2;{};{};{};", r, g, b));
-    }
-    if let Some([r, g, b]) = theme().sel_fg {
-        s.push_str(&format!("38;2;{};{};{};", r, g, b));
-    }
-    if s.is_empty() {
-        s.push_str("1;48;2;0;95;175;38;2;209;229;255");
-    }
-    s.pop();
-    s
 }
 
 /// Byte range of the first plain case-insensitive occurrence of `query` in the
@@ -2248,6 +2317,28 @@ pub(crate) fn char_width(c: char) -> usize {
 /// Display width of a string in terminal cells.
 pub(crate) fn str_width(s: &str) -> usize {
     s.chars().map(char_width).sum()
+}
+
+/// Keep the rightmost part of `s` that fits in `max` cells, prefixed with `…`.
+/// The tail of a path is the part that changes while browsing, so it is the
+/// part the border label keeps.
+fn fit_left(s: &str, max: usize) -> String {
+    if max == 0 || s.is_empty() || str_width(s) <= max {
+        return s.to_string();
+    }
+    let mut tail: Vec<char> = Vec::new();
+    let mut width = 0usize;
+    for ch in s.chars().rev() {
+        let w = char_width(ch);
+        if width + w + 1 > max {
+            break;
+        }
+        width += w;
+        tail.push(ch);
+    }
+    let mut out = String::from("\u{2026}");
+    out.extend(tail.into_iter().rev());
+    out
 }
 
 pub(crate) fn ansi_pad(line: &mut String, width: usize) {
@@ -2668,7 +2759,7 @@ mod view_test {
             },
         );
         app.box_w = 60;
-        app.box_h = 8; // 5 entry rows
+        app.box_h = 16; // fzf --height=16: ten entry rows
         app.pop_top = 0;
         app.kitty = false;
         // A history file from a previous run must not filter the fixture.
@@ -2683,7 +2774,7 @@ mod view_test {
         app.view = ViewMode::List;
         let rows = frame_rows(&mut app);
         let hits: Vec<&String> = rows.iter().filter(|r| r.contains(".txt")).collect();
-        assert_eq!(hits.len(), 5, "list fills every entry row: {rows:?}");
+        assert_eq!(hits.len(), 10, "list fills every entry row: {rows:?}");
         for row in hits {
             assert_eq!(
                 row.matches(".txt").count(),
@@ -2769,7 +2860,7 @@ mod view_test {
     fn long_keeps_meta_without_header_when_two_rows_fit() {
         let (mut app, dir) = layout_fixture("two_rows");
         app.view = ViewMode::Long;
-        app.box_h = 5; // two entry rows, no space for the header
+        app.box_h = 6; // two entry rows, no space for the header
         assert_eq!(app.list_rows(), 2);
         assert!(app.shows_meta(), "meta columns fit in two rows");
         let rows = frame_rows(&mut app);
@@ -2790,36 +2881,40 @@ mod view_test {
         let (mut app, dir) = layout_fixture("header");
         app.view = ViewMode::Long;
         let rows = frame_rows(&mut app);
-        let header = &rows[1]; // rows[0] is the top border
-        assert!(
-            header.contains("PERM") && header.contains("MODIFIED"),
-            "header row: {header:?}"
-        );
+        let header = rows
+            .iter()
+            .find(|r| r.contains("PERM") && r.contains("MODIFIED"))
+            .expect("the long-view header row");
         let entry = rows
             .iter()
             .find(|r| r.contains("f00.txt"))
             .expect("an entry row");
+        let col = |row: &str, pat: &str| {
+            row.find(pat)
+                .map(|i| str_width(&row[..i]))
+                .expect("the pattern is on the row")
+        };
         assert_eq!(
-            header.find("PERM"),
-            entry.find("-rw"),
+            col(header, "PERM"),
+            col(entry, "-rw"),
             "the perm column starts where the perms start"
         );
         assert_eq!(
-            header.find("NAME"),
-            entry.find("f00.txt"),
+            col(header, "NAME"),
+            col(entry, "f00.txt"),
             "the NAME column starts where the labels start"
         );
-        // The header costs one entry row: box_h = 8 leaves four, not five.
+        // The header costs one entry row: box_h = 16 leaves nine, not ten.
         assert_eq!(
             rows.iter().filter(|r| r.contains(".txt")).count(),
-            4,
+            9,
             "the header takes one row: {rows:?}"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn the_selected_cell_keeps_its_background_across_the_line() {
+    fn the_current_line_uses_the_fzf_fg_plus_and_pointer() {
         let (mut app, dir) = layout_fixture("sel");
         app.view = ViewMode::List;
         let rows = frame_parts(&mut app);
@@ -2827,19 +2922,20 @@ mod view_test {
             .iter()
             .find(|r| r.contains("f00.txt"))
             .expect("the selected entry row");
+        let text = plain(row);
+        assert!(
+            text.contains("▶ f00.txt"),
+            "the current line starts with the pointer and a gap: {text:?}"
+        );
+        let th = theme_default();
         let esc = char::from_u32(0x1b).unwrap();
-        let start = row
-            .find(&format!("{esc}[{}m", sel_style()))
-            .expect("selection style on the selected row");
-        let rest = &row[start..];
-        let reset = rest
-            .find(&format!("{esc}[22;23;24;39;"))
-            .expect("style reset after the selection");
-        let span = plain(&rest[..reset]);
-        assert_eq!(
-            str_width(&span),
-            app.content_w(),
-            "the highlight fills the line instead of stopping at the name: {span:?}"
+        assert!(
+            row.contains(&format!("{esc}[{}m", th.fg_sgr(th.fg_current))),
+            "the current line takes fzf's fg+ colour"
+        );
+        assert!(
+            !row.contains("48;2;0;95;175"),
+            "the current line carries no selection bar"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2922,7 +3018,7 @@ mod view_test {
     }
 
     #[test]
-    fn a_marked_entry_is_tinted_and_marked_with_a_glyph() {
+    fn a_marked_entry_carries_the_marker_glyph() {
         let (mut app, dir) = layout_fixture("mark_view");
         app.view = ViewMode::List;
         app.ensure_ranked();
@@ -2934,34 +3030,29 @@ mod view_test {
             .find(|r| r.contains("f00.txt"))
             .expect("marked row");
         assert!(
-            plain(marked).contains("+f00.txt"),
-            "the mark column carries a glyph: {:?}",
+            plain(marked).contains("\u{258c}✓f00.txt"),
+            "the gutter and the marker glyph precede a marked row: {:?}",
             plain(marked)
         );
-        assert!(
-            marked.contains(MARK_BG),
-            "the marked cell carries the mark background"
-        );
 
-        let plain_row = rows
+        let cursor_row = rows
             .iter()
             .find(|r| r.contains("f01.txt"))
-            .expect("unmarked row");
+            .expect("cursor row");
         assert!(
-            plain(plain_row).contains("\u{2502} f01.txt"),
-            "an unmarked cell keeps the marker column blank: {:?}",
-            plain(plain_row)
+            plain(cursor_row).contains("▶ f01.txt"),
+            "the current row keeps the pointer: {:?}",
+            plain(cursor_row)
         );
-        assert!(!plain_row.contains(MARK_BG), "no mark tint without a mark");
 
-        let prompt = rows
+        let info = rows
             .iter()
             .find(|r| plain(r).contains("d1"))
-            .expect("prompt row");
+            .expect("info row");
         assert!(
-            plain(prompt).contains("+1"),
-            "the prompt counts the marks: {:?}",
-            plain(prompt)
+            plain(info).contains("(1)"),
+            "the info line counts the marks like fzf --multi: {:?}",
+            plain(info)
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2971,116 +3062,115 @@ mod view_test {
 mod contrast_invariants {
     use super::*;
 
-    /// The colour a paint constant actually carries.
-    fn rgb(sgr: &str) -> [u8; 3] {
-        contrast::sgr_rgb(sgr).expect("an rgb SGR constant")
+    #[test]
+    fn the_default_theme_is_the_fzf_profile() {
+        // Pinned to FZF_DEFAULT_OPTS (modules/user/nix-maid/cli/search.nix):
+        // a drift in either place is a style regression, not a matter of taste.
+        let t = theme_default();
+        assert_eq!((t.bg, t.fg), ([0x00, 0x00, 0x00], [0x4f, 0x5d, 0x78]));
+        assert_eq!(t.fg_current, [0x8d, 0xa6, 0xb2]);
+        assert_eq!(
+            (t.hl, t.hl_current),
+            ([0x54, 0x6c, 0x8a], [0x00, 0x5f, 0xaf])
+        );
+        assert_eq!(t.border, [0x0b, 0x25, 0x36]);
+        assert_eq!(t.separator, [0x0b, 0x25, 0x36]);
+        assert_eq!(t.info, [0x3f, 0x58, 0x76]);
+        assert_eq!(t.input, [0x6c, 0x7e, 0x96]);
+        assert_eq!(
+            (t.prompt_fg, t.pointer_fg),
+            ([0x00, 0x5f, 0xaf], [0x00, 0x5f, 0xaf])
+        );
+        assert_eq!(t.marker_fg, [0x04, 0x14, 0x1c]);
+        assert_eq!(t.footer_fg, [0xff, 0xff, 0xff]);
+        assert_eq!(t.prompt, "❯  ");
+        assert_eq!(t.pointer, "▶");
+        assert_eq!(t.marker, "✓");
     }
 
     #[test]
-    fn secondary_text_stays_readable_on_the_popup() {
-        let ratio = contrast::contrast_ratio(rgb(DIM_FG), rgb(FRAME_BG));
-        assert!(
-            ratio >= contrast::MIN_TEXT,
-            "the meta/header/counter tone is {ratio:.2}:1 on the popup, need {}:1",
-            contrast::MIN_TEXT
-        );
+    fn the_text_the_eye_follows_stays_readable() {
+        let t = theme_default();
+        for (name, fg) in [
+            ("current line", t.fg_current),
+            ("query", t.input),
+            ("footer", t.footer_fg),
+        ] {
+            let ratio = contrast::contrast_ratio(fg, t.bg);
+            assert!(
+                ratio >= contrast::MIN_TEXT,
+                "the {name} tone is {ratio:.2}:1 on the popup, need {}:1",
+                contrast::MIN_TEXT
+            );
+        }
     }
 
     #[test]
-    fn the_selection_stands_out_and_its_text_is_readable() {
-        let theme = theme_default();
-        let popup = rgb(FRAME_BG);
-        let bg = theme.sel_bg.expect("the default theme paints a bar");
-        let bar = contrast::contrast_ratio(bg, popup);
+    fn the_dim_tones_stay_perceivable() {
+        // The profile is deliberately low-contrast: the list text and the
+        // match tones stay above the non-text UI floor, the info line is
+        // decorative and only has to be perceivable.
+        let t = theme_default();
+        for (name, fg) in [
+            ("list text", t.fg),
+            ("match", t.hl),
+            ("current match", t.hl_current),
+        ] {
+            let ratio = contrast::contrast_ratio(fg, t.bg);
+            assert!(
+                ratio >= contrast::MIN_UI,
+                "the {name} tone is {ratio:.2}:1 on the popup, need {}:1",
+                contrast::MIN_UI
+            );
+        }
+        let info = contrast::contrast_ratio(t.info, t.bg);
         assert!(
-            bar >= contrast::MIN_UI,
-            "the selection bar is {bar:.2}:1 against the popup, need {}:1",
-            contrast::MIN_UI
-        );
-        let fg = theme.sel_fg.expect("the default theme sets a foreground");
-        let text = contrast::contrast_ratio(fg, bg);
-        assert!(
-            text >= contrast::MIN_TEXT,
-            "selection text is {text:.2}:1 on the bar, need {}:1",
-            contrast::MIN_TEXT
-        );
-    }
-
-    #[test]
-    fn the_selection_does_not_rely_on_colour_alone() {
-        let theme = theme_default();
-        assert!(
-            theme.sel_bold || theme.sel_underline || theme.sel_reverse,
-            "the cursor needs a non-colour cue as well"
-        );
-    }
-
-    #[test]
-    fn the_mark_glyph_is_readable_on_its_tint() {
-        let mark = rgb(MARK_BG);
-        let glyph = contrast::contrast_ratio(rgb(MARK_FG), mark);
-        assert!(
-            glyph >= contrast::MIN_TEXT,
-            "the + marker is {glyph:.2}:1 on the mark tint, need {}:1",
-            contrast::MIN_TEXT
-        );
-        // The tint is the second cue; the glyph is the first, so the tint only
-        // has to be perceivable.
-        let tint = contrast::contrast_ratio(mark, rgb(FRAME_BG));
-        assert!(
-            tint >= contrast::MIN_DECOR,
-            "the mark tint is {tint:.2}:1 against the popup, need {}:1",
+            info >= contrast::MIN_DECOR,
+            "the info tone is {info:.2}:1 on the popup, need {}:1",
             contrast::MIN_DECOR
         );
+        // The frame is the faintest paint in the profile (#0b2536 on black): a
+        // hairline, visible but never louder than the content.
+        let frame = contrast::contrast_ratio(t.border, t.bg);
+        assert!(frame > 1.2, "the frame hairline is {frame:.2}:1 on black");
     }
 
     #[test]
-    fn the_frame_line_stays_perceivable() {
-        // Decoration, not information: the frame carries no meaning on its own,
-        // so it is held to the decorative floor instead of 3:1.
-        let ratio = contrast::contrast_ratio(rgb(FRAME_BORDER), rgb(FRAME_BG));
-        assert!(
-            ratio >= contrast::MIN_DECOR,
-            "the frame line is {ratio:.2}:1 against the popup, need {}:1",
-            contrast::MIN_DECOR
-        );
+    fn the_cursor_is_a_glyph_not_only_a_colour() {
+        let t = theme_default();
+        assert_ne!(t.pointer, t.marker, "pointer and marker stay distinct");
+        assert_ne!(t.pointer, "\u{258c}", "the pointer differs from the gutter");
     }
 
     #[test]
-    fn the_sanitizer_rejects_an_unreadable_theme() {
-        // A bar indistinguishable from the popup background.
-        let bad = Theme {
-            sel_bg: Some([0, 0, 0]),
+    fn the_sanitizer_rejects_unreadable_text() {
+        // The three roles the eye tracks fall back when a hand-edited theme
+        // paints them on their own background.
+        for broken in [
+            Theme {
+                fg_current: [0, 0, 0],
+                ..theme_default()
+            },
+            Theme {
+                input: [0, 0, 0],
+                ..theme_default()
+            },
+            Theme {
+                footer_fg: [0, 0, 0],
+                ..theme_default()
+            },
+        ] {
+            let fixed = broken.sanitized();
+            assert_ne!(fixed.fg_current, [0, 0, 0]);
+            assert_ne!(fixed.input, [0, 0, 0]);
+            assert_ne!(fixed.footer_fg, [0, 0, 0]);
+        }
+        // The dim roles are honoured verbatim: they *are* the profile.
+        let dim = Theme {
+            fg: [0, 0, 0],
             ..theme_default()
         };
-        assert_eq!(
-            bad.sanitized().sel_bg,
-            theme_default().sel_bg,
-            "an invisible selection bar falls back to the default"
-        );
-
-        // Selection text painted in the bar colour: 1:1 contrast.
-        let bar = theme_default().sel_bg.expect("a default bar");
-        let bad = Theme {
-            sel_fg: Some(bar),
-            ..theme_default()
-        };
-        assert_eq!(
-            bad.sanitized().sel_fg,
-            theme_default().sel_fg,
-            "unreadable selection text falls back to the default"
-        );
-
-        // A match highlight that vanishes on the selection bar.
-        let bad = Theme {
-            match_fg: Some(bar),
-            ..theme_default()
-        };
-        assert_eq!(
-            bad.sanitized().match_fg,
-            theme_default().match_fg,
-            "an unreadable match highlight falls back to the default"
-        );
+        assert_eq!(dim.sanitized().fg, [0, 0, 0]);
     }
 }
 
@@ -3300,7 +3390,7 @@ mod ported_test {
         let mut app = quiet_app(&dir);
         // The draw pass computes the `-N` counter; nothing else does.
         let _ = frame_rows(&mut app);
-        let text = plain(&app.prompt_line());
+        let text = plain(&app.info_line(80));
         assert!(
             text.contains("-1"),
             "the dot rule hides `.hidden`, so -1 must show: {text}"
@@ -3310,7 +3400,7 @@ mod ported_test {
         app.on_action(Action::ToggleLocked).unwrap();
         app.on_action(Action::ToggleRecentFirst).unwrap();
         let _ = frame_rows(&mut app);
-        let text = plain(&app.prompt_line());
+        let text = plain(&app.info_line(80));
         for flag in ["H", "I", "L", "R"] {
             assert!(text.contains(flag), "flag {flag} missing from {text}");
         }
@@ -3423,16 +3513,16 @@ mod ported_test {
         let dir = nav_fixture("anchor");
         let start = dir.clone();
         let mut app = quiet_app(&dir);
-        let text = plain(&app.prompt_line());
+        let text = plain(&app.border_label(80));
         assert!(!text.contains('>'), "no separator at the start dir: {text}");
 
         app.navigate(start.join("sub"));
-        let text = plain(&app.prompt_line());
+        let text = plain(&app.border_label(80));
         assert!(text.contains(" > sub"), "anchored subpath: {text}");
         assert!(!text.contains("sub/sub"));
 
         app.navigate(start.parent().unwrap().to_path_buf());
-        let text = plain(&app.prompt_line());
+        let text = plain(&app.border_label(80));
         assert!(text.contains("*>"), "the launch dir is below: {text}");
         assert!(
             text.contains("anchor"),

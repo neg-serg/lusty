@@ -7,7 +7,7 @@
 //!   on start               -> "C <total> <depth> <root>" (ready banner),
 //!                             then "X preview" (capability; see below)
 //!   Q <from> <to> <query> [sort] [dirs] [rev]
-//!                            -> "N <matched>", "W <maxw>", then
+//!                            -> "N <matched> <total>", "W <maxw>", then
 //!                               "R <i> <kind> <label>\t<path>" rows for
 //!                               ranked indices in [from,to), then "E".
 //!                               sort is optional (default 0 = the canonical
@@ -289,7 +289,10 @@ pub fn serve(
                     memo_frec_rev = frec_rev;
                 }
                 let ranked = &memo_ranked;
-                writeln!(out, "N {}", ranked.len())?;
+                // Matched and total: the nvim client renders fzf's `N/M`
+                // counter from both numbers (older clients split once and
+                // ignore the extra token).
+                writeln!(out, "N {} {}", ranked.len(), entries.len())?;
                 writeln!(out, "W {}", memo_maxw)?;
                 // from/to arrive independently from the client: clamp them
                 // against each other as well, so a reversed or stale range is

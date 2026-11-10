@@ -5,32 +5,36 @@ Native file/buffer picker for Neovim: a fast Rust listing backend
 terminal UI (raw-mode, eza-style).
 
 Succeeds the original Vim [LustyExplorer](https://github.com/sjbach/Lusty)
-UX: bottom float, incremental fuzzy filtering, RU/EN layouts — but with a
-parallel walker, LS_COLORS coloring and metadata views.
+UX: a fzf-style bottom panel (prompt on top, info line under it, footer hints),
+incremental fuzzy filtering, RU/EN layouts — but with a parallel walker,
+LS_COLORS coloring and metadata views. The look is the fzf profile from
+`FZF_DEFAULT_OPTS` (`❯` prompt, `▶` pointer, `✓` marker, the same palette), so
+the two pickers read as one tool.
 
 ## Features
 
 - Depth-limited parallel listing (`rayon`), skip-dirs, mount-point pruning
 - Fuzzy ranking with first-letter prefix anchoring (RU keyboard layout maps
   to EN automatically)
-- Standalone TUI: grid or long view, eza-style columns
+- Standalone TUI: list (default), grid or long view, eza-style columns
   (`--columns perm,user,size,time`, env `LUSTY_COLUMNS`),
   sorting (`--sort name|ext|size|time`, `--reverse`, `--dirs-first`),
   icons (`LUSTY_ICONS=1` or `--icons`), runtime search depth (`C-d`, 1..6), a
   starting query (`--query`), a restored last query
   (`$XDG_STATE_HOME/lusty/history`; `LUSTY_HISTORY` overrides the file,
   `LUSTY_HISTORY=0` disables), a display-cell-aware grid (CJK/emoji names stay
-  aligned), the shared `theme.toml` (selection + match colours, same file as the
-  nvim float) and an asynchronous right-hand preview pane (chafa / git diff /
+  aligned), the shared fzf-profile `theme.toml` (glyphs + palette, same file
+  as the nvim picker) and an asynchronous right-hand preview pane (chafa / git
+  diff /
   man) that places images with the kitty graphics protocol when the terminal
   supports it (`LUSTY_KITTY=0` disables, ANSI art otherwise)
-- `serve` subcommand: headless backend for nvim floating windows — no
+- `serve` subcommand: headless backend for the nvim picker split — no
   terminal buffer involved, so it renders reliably even inside a web xterm
-- Neovim float client: `C-l` toggles the long view (metadata via the `M`
+- Neovim picker client: `C-l` toggles the long view (metadata via the `M`
   request, fetched only for visible rows), `C-y` cycles the sort order,
   `C-s`/sort keys follow the config, `C-Space` marks files (multi-select),
   `C-r` toggles the preview pane (file content / git diff / man / colour chafa
-  art via SGR→extmarks). These are the float's own keys — the standalone picker
+  art via SGR→extmarks). These are the picker's own keys — the standalone picker
   below uses `alt-v`, `alt-p` and `alt-l` for the same toggles, because `C-l`
   and `C-r` keep their terminal meanings there.
 - Frecency-aware empty query: the client ships its open-frequency journal with
@@ -73,18 +77,21 @@ toggles, `?` help, path insertion and clipboard copy — are ported from
 invariants behind it and `LUSTY_KEYS` remapping.
 
 C-x marks the entry under the cursor and steps to the next one. Marks survive
-re-filtering, sorting and re-rooting; the prompt shows `+N`, and Enter then
+re-filtering, sorting and re-rooting; the info line shows `(N)`, and Enter then
 prints one `ACTION<TAB>PATH` line per marked entry, in the order they were
-marked. Marked cells keep a `+` in a one-cell column, so the state does not
-depend on the tint alone.
+marked. Marked rows carry the marker glyph (`✓` in the default profile), so the
+state does not depend on a tint alone.
 
-`list` is one entry per row, `grid` (the default) packs as many adaptive
-columns as the popup width allows — filled top-to-bottom, columns left to
-right — and `long` puts the eza `-l` style mode/size/date in front of each
-name, under a `PERM USER SIZE MODIFIED NAME` header whose columns line up with
-the rows. The selected cell is highlighted across its whole width, and the
-prompt ends with the search depth and a `matched/total` counter, so a filter
-that hides everything is visible at a glance.
+`list` (the default, matching fzf) is one entry per row: the current row starts
+with the `▶` pointer and takes the `fg+` colour, its matched characters take
+`hl+`, every other row keeps the `▌` gutter (so the pointer column reads as a
+bar) and the LS_COLORS name colour with `hl` matches. `grid` packs adaptive
+columns across the popup; `long` puts the eza `-l` style mode/size/date in front
+of each name, under a `PERM USER SIZE MODIFIED NAME` header whose columns line
+up with the rows. The info line under the prompt carries `matched/total`, the
+mark count, the search depth and the `H`/`I`/`L`/`R` flags, so a filter that
+hides everything is visible at a glance; the browsed directory rides in the
+border label and the footer lists the key hints.
 
 A window with a single entry row (`--rows 4`) becomes a horizontal strip in
 every mode: `list` and `long` drop the meta columns and the header there
@@ -143,7 +150,7 @@ Invariants (each one is asserted in the test suite):
 - **the help overlay is the keymap**: `?` renders `Action::ALL` order from the
   same table the dispatcher reads, so a rebind shows up immediately and an
   unbound action disappears. The overlay is scrollable and grows the popup
-  instead of clipping itself to five rows.
+  instead of clipping itself to the entry rows.
 - **printable action keys are shadows of real characters**: `/`, `[`, `\` and
   `?` act only while the prompt is empty. With text in the prompt they are
   typed, so `,`, `.`, `/` and every other character stay reachable
@@ -157,9 +164,9 @@ Invariants (each one is asserted in the test suite):
 - **a fresh visit truncates the forward history tail**; `back`/`forward` stop at
   the ends instead of wrapping; the launch directory stays reachable from
   anywhere, which is what makes `cancel` a jump instead of an exit.
-- **no state is encoded in colour alone**: `H`/`I`/`L`/`R`, `+N` and `-N` are
-  letters and digits, and the icon tint never replaces the selection foreground
-  (the WCAG floors above still hold).
+- **no state is encoded in colour alone**: `H`/`I`/`L`/`R`, `(N)` marks and
+  `-N` are letters and digits, and the `▶`/`▌`/`✓` glyphs are shapes, not
+  tints (the palette itself is the fzf profile; see Colour profile).
 
 Environment and flags for this layer:
 
@@ -186,15 +193,16 @@ does not know keeps the `LS_COLORS` foreground.
 
 ### Colour invariants
 
-Every colour the popup paints is held to a computed WCAG 2.1 floor
-(`src/contrast.rs`, asserted in `contrast_invariants`): secondary text (meta,
-header, counter) ≥ 4.5:1 on the popup, the selection bar ≥ 3:1 against it with
-its text ≥ 4.5:1 on the bar, the `+` mark glyph ≥ 4.5:1 on the mark tint, and
-the frame line at a 1.5:1 decorative floor. The cursor carries bold (or
-underline/reverse) and the mark carries a glyph, so neither state is encoded in
-colour alone. A `theme.toml` field that breaks its floor falls back to the
-default value, so a bad theme degrades to readable colours instead of an
-unreadable frame.
+The palette is the fzf profile from `FZF_DEFAULT_OPTS`: `bg`/`fg`/`fg+`,
+`hl`/`hl+`, `border`, `separator`, `info`, `input`, `pointer`, `marker` and
+`footer`, with the `❯`/`▶`/`✓` glyphs. `src/contrast.rs` still guards the
+three roles the eye follows — the current line, the query and the footer are
+held to 4.5:1 on the background and fall back to the default value when a
+hand-edited `theme.toml` would swallow them. The dim tones (`fg`, `hl`, `info`)
+are the profile's deliberate low-contrast choices and are honoured verbatim;
+the tests pin the exact palette instead of imposing AA floors on them. The
+pointer/marker/gutter are different glyphs, so the cursor and the marks are
+never encoded in colour alone.
 
 ## serve protocol
 

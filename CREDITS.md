@@ -1,8 +1,20 @@
 # Credits and provenance
 
 lusty is licensed under the MIT license (see `LICENSE`). Two upstream projects
-shaped the browse-mode interaction layer; their licenses and the exact parts
-that were ported are recorded here.
+shaped the browse-mode interaction layer, and a third is the reference for the
+picker's visual profile; their licenses and the exact parts that were ported
+are recorded here.
+
+## fzf — the visual profile
+
+<https://github.com/junegunn/fzf> by **Junegunn Choi**, MIT licensed.
+
+The picker chrome follows fzf's rendering model (`--layout=reverse`,
+`--info=default`, `--border=sharp`, the footer) and takes its glyphs and
+palette from the `FZF_DEFAULT_OPTS` profile in the NixOS configuration: the
+`❯` prompt, `▶` pointer, `✓` marker and the `fg`/`fg+`/`hl`/`hl+` roles. The
+layout was derived from fzf 0.74.5 (its option surface and documented
+defaults); no fzf code was copied.
 
 ## fzf-navigator — the interaction layer was ported from it
 

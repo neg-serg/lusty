@@ -110,7 +110,7 @@ fn serve_lists_all_on_empty_first_query() {
     let resp = until_e(&mut lines);
     assert_eq!(
         resp.first().map(String::as_str),
-        Some("N 2"),
+        Some("N 2 2"),
         "resp: {resp:?}"
     );
     assert!(resp.iter().any(|l| l.starts_with("W ")));
@@ -233,7 +233,7 @@ fn ask_q(
     let resp = until_e(lines);
     assert_eq!(
         resp.first().map(String::as_str),
-        Some("N 3"),
+        Some("N 3 3"),
         "resp: {resp:?}"
     );
     resp.iter()
@@ -282,7 +282,7 @@ fn serve_q_reversed_range_is_empty_not_a_panic() {
 
     ask(&mut stdin, "Q\t1\t0\t\t0");
     let resp = until_e(&mut lines);
-    assert_eq!(resp.first().map(String::as_str), Some("N 2"), "{resp:?}");
+    assert_eq!(resp.first().map(String::as_str), Some("N 2 2"), "{resp:?}");
     assert!(
         !resp.iter().any(|l| l.starts_with("R ")),
         "reversed range yields no rows: {resp:?}"

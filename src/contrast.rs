@@ -9,6 +9,7 @@
 /// WCAG 2.1 AA floor for normal-size text.
 pub const MIN_TEXT: f64 = 4.5;
 /// WCAG 2.1 AA floor for non-text UI components (and large text).
+#[cfg_attr(not(test), allow(dead_code))]
 pub const MIN_UI: f64 = 3.0;
 /// Floor for purely decorative-but-perceivable paint (frame lines, a tint that
 /// is only a second cue). Below this a colour is effectively invisible. The
@@ -19,6 +20,7 @@ pub const MIN_DECOR: f64 = 1.5;
 
 /// Parse an SGR parameter string such as `48;2;r;g;b` (or `38;2;r;g;b`) back
 /// into RGB, so the tests read exactly the constants the renderer paints.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn sgr_rgb(sgr: &str) -> Option<[u8; 3]> {
     let mut parts = sgr.split(';');
     match parts.next()? {

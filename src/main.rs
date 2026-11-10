@@ -3,7 +3,8 @@
 //! Three front-ends share the listing stack: `--list` (benchmark/plumbing,
 //! depth/skip/mount semantics, ranking, LS_COLORS coloring), `serve` (the
 //! headless line-protocol backend for the nvim float) and the standalone
-//! raw-mode TUI (grid/long views, preview pane, RU/EN layout).
+//! raw-mode TUI (fzf-style chrome, list/grid/long views, preview pane, RU/EN
+//! layout).
 
 mod contrast;
 mod serve;
@@ -194,10 +195,11 @@ fn main() {
   root      start directory (default: current)
   --depth N listing depth (default 2)
   --skip a,b  directories skipped (default pic,tmp)
-  --rows N  popup total height incl borders (default 8)
+  --rows N  popup total height incl borders (default 16, fzf --height)
   --width N popup total width incl borders (default: full terminal width)
   --long    same as --view long (eza -l style rows)
-  --view M  list (one column), grid (default, adaptive columns), or long;
+  --view M  list (default, one entry per row like fzf), grid (adaptive
+            columns), or long;
             also LUSTY_VIEW=list|grid|long, alt-v cycles them in the picker
   --sort S  start order: name (default), ext, size (desc), time (desc)
   --reverse reverse each depth group (eza --reverse)
@@ -359,8 +361,8 @@ command-line flags win.
         follow_mounts: false,
         show_dots: false,
     };
-    // CLI flags win over the environment; grid is the default (the adaptive
-    // multi-column layout the picker always had).
+    // CLI flags win over the environment; the list (one entry per row, like
+    // fzf) is the default, grid stays one alt-v away.
     if view.is_none() {
         view = std::env::var("LUSTY_VIEW")
             .ok()
